@@ -17,6 +17,7 @@
 #include "utils/list.h"
 #include "ap_config.h"
 #include "drivers/driver.h"
+#include "ubus.h"
 
 #define OCE_STA_CFON_ENABLED(hapd) \
 	((hapd->conf->oce & OCE_STA_CFON) && \
@@ -145,6 +146,7 @@ struct hostapd_data {
 	struct hostapd_iface *iface;
 	struct hostapd_config *iconf;
 	struct hostapd_bss_config *conf;
+	struct hostapd_ubus_bss ubus;
 	int interface_added; /* virtual interface added for this BSS */
 	unsigned int started:1;
 	unsigned int disabled:1;

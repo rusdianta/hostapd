@@ -188,6 +188,12 @@ ifdef CONFIG_EAPOL_TEST
 CFLAGS += -Werror -DEAPOL_TEST
 endif
 
+ifdef CONFIG_UBUS
+CFLAGS += -DUBUS_SUPPORT
+OBJS += ubus.o
+LIBS += -lubox -lubus
+endif
+
 ifdef CONFIG_CODE_COVERAGE
 CFLAGS += -O0 -fprofile-arcs -ftest-coverage
 LIBS += -lgcov
@@ -944,6 +950,9 @@ OBJS += ../src/ap/ieee802_11_vht.o
 endif
 ifdef CONFIG_IEEE80211AX
 OBJS += ../src/ap/ieee802_11_he.o
+endif
+ifdef CONFIG_UBUS
+OBJS += ../src/ap/ubus.o
 endif
 endif
 ifdef CONFIG_WNM_AP

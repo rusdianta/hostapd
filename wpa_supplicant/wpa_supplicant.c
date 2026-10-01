@@ -2153,6 +2153,8 @@ void ibss_mesh_setup_freq(struct wpa_supplicant *wpa_s,
 	struct hostapd_freq_params vht_freq;
 	int chwidth, seg0, seg1;
 	u32 vht_caps = 0;
+	int dfs_enabled = wpa_s->conf->country[0] &&
+		(wpa_s->drv_flags & WPA_DRIVER_FLAGS_RADAR);
 
 	freq->freq = ssid->frequency;
 
@@ -2232,8 +2234,11 @@ void ibss_mesh_setup_freq(struct wpa_supplicant *wpa_s,
 		return;
 
 	/* Check primary channel flags */
-	if (pri_chan->flag & (HOSTAPD_CHAN_DISABLED | HOSTAPD_CHAN_NO_IR))
+	if (pri_chan->flag & HOSTAPD_CHAN_DISABLED)
 		return;
+	if (pri_chan->flag & (HOSTAPD_CHAN_RADAR | HOSTAPD_CHAN_NO_IR))
+		if (!dfs_enabled)
+			return;
 
 	freq->channel = pri_chan->chan;
 
@@ -2264,8 +2269,11 @@ void ibss_mesh_setup_freq(struct wpa_supplicant *wpa_s,
 		return;
 
 	/* Check secondary channel flags */
-	if (sec_chan->flag & (HOSTAPD_CHAN_DISABLED | HOSTAPD_CHAN_NO_IR))
+	if (sec_chan->flag & HOSTAPD_CHAN_DISABLED)
 		return;
+	if (sec_chan->flag & (HOSTAPD_CHAN_RADAR | HOSTAPD_CHAN_NO_IR))
+		if (!dfs_enabled)
+			return;
 
 	if (ht40 == -1) {
 		if (!(pri_chan->flag & HOSTAPD_CHAN_HT40MINUS))
@@ -2356,8 +2364,11 @@ skip_ht40:
 			return;
 
 		/* Back to HT configuration if channel not usable */
-		if (chan->flag & (HOSTAPD_CHAN_DISABLED | HOSTAPD_CHAN_NO_IR))
+		if (chan->flag & HOSTAPD_CHAN_DISABLED)
 			return;
+		if (chan->flag & (HOSTAPD_CHAN_RADAR | HOSTAPD_CHAN_NO_IR))
+			if (!dfs_enabled)
+				return;
 	}
 
 	chwidth = CHANWIDTH_80MHZ;
@@ -2377,10 +2388,11 @@ skip_ht40:
 				if (!chan)
 					continue;
 
-				if (chan->flag & (HOSTAPD_CHAN_DISABLED |
-						  HOSTAPD_CHAN_NO_IR |
-						  HOSTAPD_CHAN_RADAR))
+				if (chan->flag & HOSTAPD_CHAN_DISABLED)
 					continue;
+				if (chan->flag & (HOSTAPD_CHAN_RADAR | HOSTAPD_CHAN_NO_IR))
+					if (!dfs_enabled)
+						continue;
 
 				/* Found a suitable second segment for 80+80 */
 				chwidth = CHANWIDTH_80P80MHZ;

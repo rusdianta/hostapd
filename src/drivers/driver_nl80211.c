@@ -7462,6 +7462,10 @@ static int wpa_driver_nl80211_send_action(struct i802_bss *bss,
 	int ret = -1;
 	u8 *buf;
 	struct ieee80211_hdr *hdr;
+	struct hostapd_hw_modes *modes;
+	int i, offchanok = 1;
+	u16 num_modes, flags;
+	u8 dfs_domain;
 
 	wpa_printf(MSG_DEBUG, "nl80211: Send Action frame (ifindex=%d, "
 		   "freq=%u MHz wait=%d ms no_cck=%d)",
@@ -7486,6 +7490,21 @@ static int wpa_driver_nl80211_send_action(struct i802_bss *bss,
 		os_memset(bss->rand_addr, 0, ETH_ALEN);
 	}
 
+	if (is_mesh_interface(drv->nlmode)) {
+		modes = nl80211_get_hw_feature_data(bss, &num_modes,
+						    &flags, &dfs_domain);
+		if (dfs_domain != HOSTAPD_DFS_REGION_ETSI &&
+		    ieee80211_is_dfs(bss->freq, modes, num_modes))
+			offchanok = 0;
+		if (modes) {
+			for (i = 0; i < num_modes; i++) {
+				os_free(modes[i].channels);
+				os_free(modes[i].rates);
+			}
+			os_free(modes);
+		}
+	}
+
 	if (is_ap_interface(drv->nlmode) &&
 	    (!(drv->capa.flags & WPA_DRIVER_FLAGS_OFFCHANNEL_TX) ||
 	     (int) freq == bss->freq || drv->device_ap_sme ||
@@ -7497,7 +7516,7 @@ static int wpa_driver_nl80211_send_action(struct i802_bss *bss,
 		ret = nl80211_send_frame_cmd(bss, freq, wait_time, buf,
 					     24 + data_len,
 					     &drv->send_action_cookie,
-					     no_cck, 0, 1, NULL, 0);
+					     no_cck, 0, offchanok, NULL, 0);
 
 	os_free(buf);
 	return ret;

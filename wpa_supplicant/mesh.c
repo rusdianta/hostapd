@@ -386,6 +386,7 @@ static int wpa_supplicant_mesh_init(struct wpa_supplicant *wpa_s,
 		conf->basic_rates[rate_len] = -1;
 	}
 
+	conf->no_pri_sec_switch = 1;
 	/* Handle pri/sec switch frequency within AP configuration parameter
 	 * generation without changing the stored network profile in the end. */
 	saved_freq = ssid->frequency;

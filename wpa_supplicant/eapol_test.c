@@ -30,7 +30,12 @@
 #include "ctrl_iface.h"
 #include "pcsc_funcs.h"
 #include "wpas_glue.h"
+#include "drivers/driver.h"
 
+void (*wpa_supplicant_event)(void *ctx, enum wpa_event_type event,
+			     union wpa_event_data *data);
+void (*wpa_supplicant_event_global)(void *ctx, enum wpa_event_type event,
+			     union wpa_event_data *data);
 
 const struct wpa_driver_ops *const wpa_drivers[] = { NULL };
 
@@ -1292,6 +1297,10 @@ static void usage(void)
 	       "option several times.\n");
 }
 
+extern void supplicant_event(void *ctx, enum wpa_event_type event,
+			     union wpa_event_data *data);
+extern void supplicant_event_global(void *ctx, enum wpa_event_type event,
+			     union wpa_event_data *data);
 
 int main(int argc, char *argv[])
 {
@@ -1312,6 +1321,8 @@ int main(int argc, char *argv[])
 	if (os_program_init())
 		return -1;
 
+	wpa_supplicant_event = supplicant_event;
+	wpa_supplicant_event_global = supplicant_event_global;
 	hostapd_logger_register_cb(hostapd_logger_cb);
 
 	os_memset(&eapol_test, 0, sizeof(eapol_test));

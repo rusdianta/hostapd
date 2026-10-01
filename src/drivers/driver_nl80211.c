@@ -590,6 +590,7 @@ struct wiphy_idx_data {
 	int wiphy_idx;
 	enum nl80211_iftype nlmode;
 	u8 *macaddr;
+	u8 use_4addr;
 };
 
 
@@ -611,6 +612,9 @@ static int netdev_info_handler(struct nl_msg *msg, void *arg)
 	if (tb[NL80211_ATTR_MAC] && info->macaddr)
 		os_memcpy(info->macaddr, nla_data(tb[NL80211_ATTR_MAC]),
 			  ETH_ALEN);
+
+	if (tb[NL80211_ATTR_4ADDR])
+		info->use_4addr = nla_get_u8(tb[NL80211_ATTR_4ADDR]);
 
 	return NL_SKIP;
 }
@@ -661,6 +665,20 @@ static int nl80211_get_macaddr(struct i802_bss *bss)
 		return -1;
 
 	return send_and_recv_msgs(bss->drv, msg, netdev_info_handler, &data);
+}
+
+
+static int nl80211_get_4addr(struct i802_bss *bss)
+{
+	struct nl_msg *msg;
+	struct wiphy_idx_data data = {
+		.use_4addr = 0,
+	};
+
+	if (!(msg = nl80211_cmd_msg(bss, 0, NL80211_CMD_GET_INTERFACE)) ||
+	    send_and_recv_msgs(bss->drv, msg, netdev_info_handler, &data))
+		return -1;
+	return data.use_4addr;
 }
 
 
@@ -11028,6 +11046,11 @@ static int nl80211_set_4addr_mode(void *priv, const char *bridge_ifname,
 
 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
 	msg = NULL;
+	if (ret && val && nl80211_get_4addr(bss) == 1) {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: 4addr mode was already enabled");
+		ret = 0;
+	}
 	if (!ret) {
 		if (bridge_ifname[0] && val &&
 		    i802_check_bridge(drv, bss, bridge_ifname, bss->ifname) < 0)

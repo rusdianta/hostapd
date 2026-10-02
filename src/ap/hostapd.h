@@ -433,6 +433,8 @@ struct hostapd_iface {
 		HAPD_IFACE_ENABLED
 	} state;
 
+	int acs_nf_fallback_logged;
+
 #ifdef CONFIG_MESH
 	struct mesh_conf *mconf;
 #endif /* CONFIG_MESH */

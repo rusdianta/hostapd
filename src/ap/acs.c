@@ -388,6 +388,19 @@ acs_bss_power_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data 
 }
 
 
+#ifndef ACS_SCORE_SURVEY
+#define ACS_SCORE_SURVEY        0.50L
+#endif /* ACS_SCORE_SURVEY */
+
+#ifndef ACS_SCORE_BSS
+#define ACS_SCORE_BSS           0.30L
+#endif /* ACS_SCORE_BSS */
+
+#ifndef ACS_SCORE_INTERACTION
+#define ACS_SCORE_INTERACTION   0.20L
+#endif /* ACS_SCORE_INTERACTION */
+
+
 static long double
 acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
 		  long double survey_min, long double survey_max,
@@ -396,6 +409,8 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 	long double survey_score;
 	long double bss_score;
 	long double bss_power;
+	long double interaction;
+	long double score;
 
 	if (survey_max > survey_min)
 		survey_score = (chan->interference_factor - survey_min) / (survey_max - survey_min);
@@ -409,7 +424,17 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 	else
 		bss_score = 0;
 
-	return survey_score + bss_score;
+	interaction = bss_score * bss_score * survey_score;
+
+	score = ACS_SCORE_SURVEY * survey_score +
+		ACS_SCORE_BSS * bss_score +
+		ACS_SCORE_INTERACTION * interaction;
+
+	wpa_printf(MSG_DEBUG,
+		   "ACS: CH %d score=%.3Lf survey=%.3Lf bss=%.3Lf interaction=%.3Lf",
+		   chan->chan, score, survey_score, bss_score, interaction);
+
+	return score;
 }
 
 

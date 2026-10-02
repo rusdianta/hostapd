@@ -279,6 +279,13 @@ void acs_cleanup(struct hostapd_iface *iface)
 
 	os_free(iface->acs_bss_power);
 	iface->acs_bss_power = NULL;
+
+	os_free(iface->acs_bss_rssi);
+	iface->acs_bss_rssi = NULL;
+
+	os_free(iface->acs_channel_scores);
+	iface->acs_channel_scores = NULL;
+
 	iface->chans_surveyed = 0;
 	iface->acs_num_completed_scans = 0;
 }
@@ -343,6 +350,9 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 				continue;
 
 			iface->acs_bss_power[j] += power;
+
+			if (bss->level > iface->acs_bss_rssi[j])
+				iface->acs_bss_rssi[j] = bss->level;
 
 			/*
 			 * Avoid excessive values if a driver reports
@@ -884,15 +894,15 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		 * and BSS scores unless an explicit acs_chan_bias is configured. */
 		if (bias) {
 			factor *= bias->bias;
-			wpa_printf(MSG_DEBUG,
-				   "ACS:  * channel %d: total interference = %Lg (%f bias)",
-				   chan->chan, factor, bias->bias);
-		} else {
-			wpa_printf(MSG_DEBUG,
-				   "ACS:  * channel %d: total interference = %Lg",
-				   chan->chan, factor);
 		}
 
+		/* Store the final factor for logging. This is after all existing
+		 * score calculation, adjacent-channel weighting, normalization,
+		 * and optional channel bias. */
+		if (iface->acs_channel_scores)
+			iface->acs_channel_scores[i] = factor;
+
+		/* Existing channel selection logic remains unchanged. */
 		if (acs_usable_chan(chan) &&
 		    (!ideal_chan || factor < ideal_factor)) {
 			ideal_factor = factor;
@@ -902,6 +912,28 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		/* This channel would at least be usable */
 		if (!rand_chan)
 			rand_chan = chan;
+	}
+
+	/* Log the final values after the selection pass so that the channel
+	 * selected by ACS can be marked explicitly. */
+	for (i = 0; i < iface->current_mode->num_channels; i++) {
+		chan = &iface->current_mode->channels[i];
+
+		if (!iface->acs_channel_scores ||
+		    iface->acs_channel_scores[i] < 0)
+			continue;
+
+		if (iface->acs_bss_rssi[i] > -127) {
+			wpa_printf(MSG_INFO,
+				   "ACS: Channel %d rssi=%d interference=%Lg score=%Lg%s",
+				   chan->chan, iface->acs_bss_rssi[i], chan->interference_factor, iface->acs_channel_scores[i],
+				   chan == ideal_chan ? " selected" : "");
+		} else {
+			wpa_printf(MSG_INFO,
+				   "ACS: Channel %d rssi=none interference=%Lg score=%Lg%s",
+				   chan->chan, chan->interference_factor, iface->acs_channel_scores[i],
+				   chan == ideal_chan ? " selected" : "");
+		}
 	}
 
 	if (ideal_chan) {
@@ -1095,6 +1127,8 @@ static int acs_request_scan(struct hostapd_iface *iface)
 
 enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 {
+	unsigned int i;
+
 	wpa_printf(MSG_INFO, "ACS: Automatic channel selection started, this may take a bit");
 
 	if (iface->drv_flags & WPA_DRIVER_FLAGS_ACS_OFFLOAD) {
@@ -1114,6 +1148,23 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 			sizeof(*iface->acs_bss_power));
 	if (!iface->acs_bss_power)
 		return HOSTAPD_CHAN_INVALID;
+
+	iface->acs_bss_rssi = os_malloc(iface->current_mode->num_channels * sizeof(*iface->acs_bss_rssi));
+	if (!iface->acs_bss_rssi) {
+		acs_cleanup(iface);
+		return HOSTAPD_CHAN_INVALID;
+	}
+
+	iface->acs_channel_scores = os_malloc(iface->current_mode->num_channels * sizeof(*iface->acs_channel_scores));
+	if (!iface->acs_channel_scores) {
+		acs_cleanup(iface);
+		return HOSTAPD_CHAN_INVALID;
+	}
+
+	for (i = 0; i < iface->current_mode->num_channels; i++) {
+		iface->acs_bss_rssi[i] = -127;
+		iface->acs_channel_scores[i] = -1;
+	}
 
 	if (acs_request_scan(iface) < 0)
 		return HOSTAPD_CHAN_INVALID;

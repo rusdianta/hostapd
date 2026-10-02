@@ -400,6 +400,17 @@ acs_bss_power_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data 
 #define ACS_SCORE_INTERACTION   0.20L
 #endif /* ACS_SCORE_INTERACTION */
 
+#ifndef ACS_BSS_RSSI_MIN
+#define ACS_BSS_RSSI_MIN       -90.0L
+#endif /* ACS_BSS_RSSI_MIN */
+
+#ifndef ACS_BSS_RSSI_MAX
+#define ACS_BSS_RSSI_MAX       -40.0L
+#endif /* ACS_BSS_RSSI_MAX */
+
+#define ACS_BSS_RELATIVE_WEIGHT 0.70L
+#define ACS_BSS_ABSOLUTE_WEIGHT 0.30L
+
 
 static long double
 acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
@@ -409,8 +420,12 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 	long double survey_score;
 	long double bss_score;
 	long double bss_power;
+	long double bss_relative_score;
+	long double bss_rssi_score = 0;
 	long double interaction;
 	long double score;
+	unsigned int idx;
+	int rssi;
 
 	if (survey_max > survey_min)
 		survey_score = (chan->interference_factor - survey_min) / (survey_max - survey_min);
@@ -420,10 +435,41 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 	bss_power = acs_bss_power_for_chan(iface, chan);
 
 	if (bss_max > bss_min)
-		bss_score = (bss_power - bss_min) / (bss_max - bss_min);
+		bss_relative_score = (bss_power - bss_min) / (bss_max - bss_min);
 	else
-		bss_score = 0;
+		bss_relative_score = 0;
 
+	/* Add absolute BSS RSSI risk.
+	 *
+	 * Relative BSS power alone can rank a weak BSS as high risk
+	 * when all channels have similarly weak BSS activity. */
+	idx = chan - iface->current_mode->channels;
+
+	if (iface->acs_bss_rssi &&
+	    idx < iface->current_mode->num_channels) {
+		rssi = iface->acs_bss_rssi[idx];
+
+		if (rssi > -127) {
+			if (rssi <= ACS_BSS_RSSI_MIN) {
+				bss_rssi_score = 0;
+			} else if (rssi >= ACS_BSS_RSSI_MAX) {
+				bss_rssi_score = 1;
+			} else {
+				bss_rssi_score = ((long double) rssi - ACS_BSS_RSSI_MIN) /
+					(ACS_BSS_RSSI_MAX - ACS_BSS_RSSI_MIN);
+			}
+		}
+	}
+
+	/* Keep the relative BSS score from Patch 1 and add a limited
+	 * contribution from absolute RSSI strength. */
+	bss_score =	ACS_BSS_RELATIVE_WEIGHT * bss_relative_score + ACS_BSS_ABSOLUTE_WEIGHT * bss_rssi_score;
+
+	if (bss_score > 1)
+		bss_score = 1;
+
+	/* Strong BSS becomes more important when the channel is
+	 * already suffering from interference. */
 	interaction = bss_score * bss_score * survey_score;
 
 	score = ACS_SCORE_SURVEY * survey_score +
@@ -431,8 +477,8 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 		ACS_SCORE_INTERACTION * interaction;
 
 	wpa_printf(MSG_DEBUG,
-		   "ACS: CH %d score=%.3Lf survey=%.3Lf bss=%.3Lf interaction=%.3Lf",
-		   chan->chan, score, survey_score, bss_score, interaction);
+		   "ACS: CH %d score=%.3Lf survey=%.3Lf bss=%.3Lf bss_rssi=%.3Lf interaction=%.3Lf",
+		   chan->chan, score, survey_score, bss_score, bss_rssi_score, interaction);
 
 	return score;
 }

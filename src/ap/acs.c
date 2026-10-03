@@ -14,6 +14,7 @@
 #include "utils/list.h"
 #include "utils/eloop.h"
 #include "common/ieee802_11_defs.h"
+#include "common/ieee802_11_common.h"
 #include "common/hw_features_common.h"
 #include "common/wpa_ctrl.h"
 #include "drivers/driver.h"
@@ -250,6 +251,11 @@
 static int acs_request_scan(struct hostapd_iface *iface);
 static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_survey *survey);
 static int hostapd_acs_runtime_switch_channel(struct hostapd_iface *iface, struct hostapd_channel_data *ideal_chan);
+static int is_24ghz_mode(enum hostapd_hw_mode mode);
+static long double acs_bss_overlap_rssi_score(int rssi);
+static long double acs_frequency_overlap_ratio(int cand_start, int cand_end, int bss_start, int bss_end);
+static void acs_bss_frequency_range(struct wpa_scan_res *bss, int *start_freq, int *end_freq);
+
 
 static void acs_clean_chan_surveys(struct hostapd_channel_data *chan)
 {
@@ -288,6 +294,9 @@ void acs_cleanup(struct hostapd_iface *iface)
 	os_free(iface->acs_bss_rssi);
 	iface->acs_bss_rssi = NULL;
 
+	os_free(iface->acs_bss_overlap_risk);
+	iface->acs_bss_overlap_risk = NULL;
+
 	os_free(iface->acs_channel_scores);
 	iface->acs_channel_scores = NULL;
 
@@ -321,6 +330,13 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 	struct hostapd_channel_data *chan;
 	unsigned int i, j;
 	long double power;
+	long double overlap_risk;
+	long double rssi_score;
+	long double overlap_ratio;
+	int bss_start;
+	int bss_end;
+	int chan_start;
+	int chan_end;
 
 	if (!iface->acs_bss_power)
 		return;
@@ -341,6 +357,42 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 			continue;
 
 		power = pow(10.0L, ((long double) bss->level + 90.0L) / 10.0L);
+
+		if (is_24ghz_mode(iface->current_mode->mode) && iface->acs_bss_overlap_risk) {
+			int c;
+
+			acs_bss_frequency_range(bss, &bss_start, &bss_end);
+			rssi_score = acs_bss_overlap_rssi_score(bss->level);
+
+			for (c = 0; c < iface->current_mode->num_channels; c++) {
+				chan = &iface->current_mode->channels[c];
+
+				if (chan->flag & HOSTAPD_CHAN_DISABLED)
+					continue;
+
+				if (!is_in_chanlist(iface, chan))
+					continue;
+
+				/* ACS overlap risk is calculated against a 20 MHz
+				* candidate channel. HT40 candidates are already
+				* evaluated through the existing primary/secondary
+				* channel scoring. */
+				chan_start = chan->freq - 10;
+				chan_end = chan->freq + 10;
+
+				overlap_ratio = acs_frequency_overlap_ratio(
+					chan_start, chan_end,
+					bss_start, bss_end);
+
+				if (overlap_ratio <= 0)
+					continue;
+
+				overlap_risk = rssi_score * overlap_ratio;
+
+				if (overlap_risk > iface->acs_bss_overlap_risk[c])
+					iface->acs_bss_overlap_risk[c] = overlap_risk;
+			}
+		}
 
 		for (j = 0; j < iface->current_mode->num_channels; j++) {
 			chan = &iface->current_mode->channels[j];
@@ -419,6 +471,92 @@ acs_bss_rssi_score(struct hostapd_iface *iface, struct hostapd_channel_data *cha
 }
 
 
+static long double
+acs_bss_overlap_rssi_score(int rssi)
+{
+	long double normalized;
+
+	if (rssi <= -100)
+		return 0;
+
+	if (rssi >= -1)
+		return 1;
+
+	normalized = ((long double) rssi + 100.0L) / 99.0L;
+
+	return normalized * sqrtl(normalized);
+}
+
+
+static long double
+acs_frequency_overlap_ratio(int cand_start, int cand_end, int bss_start, int bss_end)
+{
+	int start;
+	int end;
+	int overlap;
+
+	start = cand_start > bss_start ? cand_start : bss_start;
+	end = cand_end < bss_end ? cand_end : bss_end;
+
+	if (end <= start)
+		return 0;
+
+	overlap = end - start;
+
+	return (long double) overlap /
+		(long double) (cand_end - cand_start);
+}
+
+
+static void
+acs_bss_frequency_range(struct wpa_scan_res *bss, int *start_freq, int *end_freq)
+{
+	struct ieee802_11_elems elems;
+	struct ieee80211_ht_operation *oper;
+	const u8 *ies;
+	size_t ies_len;
+	int sec;
+
+	/* Default: 20 MHz BSS. */
+	*start_freq = bss->freq - 10;
+	*end_freq = bss->freq + 10;
+
+	ies = (const u8 *) (bss + 1);
+	ies_len = bss->ie_len;
+
+	if (ieee802_11_parse_elems(ies, ies_len, &elems, 0) == ParseFailed)
+		return;
+
+	/* Some drivers may provide the HT Operation IE only in
+	 * the Beacon IE set. */
+	if (!elems.ht_operation && bss->beacon_ie_len) {
+		ies += bss->ie_len;
+		ies_len = bss->beacon_ie_len;
+
+		if (ieee802_11_parse_elems(ies, ies_len, &elems, 0) == ParseFailed)
+			return;
+	}
+
+	if (!elems.ht_operation)
+		return;
+
+	oper = (struct ieee80211_ht_operation *) elems.ht_operation;
+
+	if (!(oper->ht_param & HT_INFO_HT_PARAM_STA_CHNL_WIDTH))
+		return;
+
+	sec = oper->ht_param & HT_INFO_HT_PARAM_SECONDARY_CHNL_OFF_MASK;
+
+	if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_ABOVE) {
+		*start_freq = bss->freq - 10;
+		*end_freq = bss->freq + 30;
+	} else if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_BELOW) {
+		*start_freq = bss->freq - 30;
+		*end_freq = bss->freq + 10;
+	}
+}
+
+
 #ifndef ACS_SCORE_SURVEY
 #define ACS_SCORE_SURVEY        0.50L
 #endif /* ACS_SCORE_SURVEY */
@@ -434,6 +572,10 @@ acs_bss_rssi_score(struct hostapd_iface *iface, struct hostapd_channel_data *cha
 #ifndef ACS_SCORE_RSSI
 #define ACS_SCORE_RSSI 0.30L
 #endif /* ACS_SCORE_RSSI */
+
+#ifndef ACS_SCORE_OVERLAP_RSSI
+#define ACS_SCORE_OVERLAP_RSSI 0.45L
+#endif /* ACS_SCORE_OVERLAP_RSSI */
 
 #ifndef ACS_BSS_RSSI_MIN
 #define ACS_BSS_RSSI_MIN       -90.0L
@@ -996,14 +1138,20 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		* being diluted by clean adjacent channels. */
 		if (is_24ghz_mode(iface->current_mode->mode)) {
 			long double rssi_score;
+			long double overlap_risk;
 
 			rssi_score = acs_bss_rssi_score(iface, chan);
 
 			factor += ACS_SCORE_RSSI * rssi_score;
 
+			overlap_risk = iface->acs_bss_overlap_risk ?
+				iface->acs_bss_overlap_risk[i] : 0;
+
+			factor += ACS_SCORE_OVERLAP_RSSI * overlap_risk;
+
 			wpa_printf(MSG_DEBUG,
-				"ACS: CH %d direct_rssi=%.3Lf rssi_penalty=%.3Lf",
-				chan->chan, rssi_score,	ACS_SCORE_RSSI * rssi_score);
+				"ACS: CH %d direct_rssi=%.3Lf rssi_penalty=%.3Lf overlap_risk=%.3Lf overlap_penalty=%.3Lf",
+				chan->chan, rssi_score,	ACS_SCORE_RSSI * rssi_score, overlap_risk, ACS_SCORE_OVERLAP_RSSI * overlap_risk);
 		}
 
 		bias = NULL;
@@ -1300,6 +1448,14 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 		return HOSTAPD_CHAN_INVALID;
 	}
 
+	iface->acs_bss_overlap_risk =
+		os_calloc(iface->current_mode->num_channels,
+			sizeof(*iface->acs_bss_overlap_risk));
+	if (!iface->acs_bss_overlap_risk) {
+		acs_cleanup(iface);
+		return HOSTAPD_CHAN_INVALID;
+	}
+
 	iface->acs_channel_scores = os_malloc(iface->current_mode->num_channels * sizeof(*iface->acs_channel_scores));
 	if (!iface->acs_channel_scores) {
 		acs_cleanup(iface);
@@ -1308,6 +1464,7 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		iface->acs_bss_rssi[i] = -127;
+		iface->acs_bss_overlap_risk[i] = 0;
 		iface->acs_channel_scores[i] = -1;
 	}
 

@@ -558,6 +558,7 @@ struct hostapd_iface {
 
 	long double *acs_bss_power;
 	s8 *acs_bss_rssi;
+	long double *acs_bss_overlap_risk;
 	long double *acs_channel_scores;
 
 	/* Runtime ACS after the last associated station disconnects. */

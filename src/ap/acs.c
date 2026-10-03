@@ -393,6 +393,32 @@ acs_bss_power_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data 
 }
 
 
+static long double
+acs_bss_rssi_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan)
+{
+	unsigned int idx;
+	int rssi;
+
+	if (!iface->acs_bss_rssi)
+		return 0;
+
+	idx = chan - iface->current_mode->channels;
+
+	if (idx >= iface->current_mode->num_channels)
+		return 0;
+
+	rssi = iface->acs_bss_rssi[idx];
+
+	if (rssi <= -100)
+		return 0;
+
+	if (rssi >= 0)
+		return 1;
+
+	return ((long double) rssi + 100.0L) / 100.0L;
+}
+
+
 #ifndef ACS_SCORE_SURVEY
 #define ACS_SCORE_SURVEY        0.50L
 #endif /* ACS_SCORE_SURVEY */
@@ -404,6 +430,10 @@ acs_bss_power_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data 
 #ifndef ACS_SCORE_INTERACTION
 #define ACS_SCORE_INTERACTION   0.20L
 #endif /* ACS_SCORE_INTERACTION */
+
+#ifndef ACS_SCORE_RSSI
+#define ACS_SCORE_RSSI 0.30L
+#endif /* ACS_SCORE_RSSI */
 
 #ifndef ACS_BSS_RSSI_MIN
 #define ACS_BSS_RSSI_MIN       -90.0L
@@ -958,6 +988,23 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		}
 
 		factor /= total_weight;
+
+		/* Apply the strongest BSS RSSI penalty directly to the
+		* candidate channel after adjacent-channel averaging.
+		*
+		* This prevents a strong AP on the candidate channel from
+		* being diluted by clean adjacent channels. */
+		if (is_24ghz_mode(iface->current_mode->mode)) {
+			long double rssi_score;
+
+			rssi_score = acs_bss_rssi_score(iface, chan);
+
+			factor += ACS_SCORE_RSSI * rssi_score;
+
+			wpa_printf(MSG_DEBUG,
+				"ACS: CH %d direct_rssi=%.3Lf rssi_penalty=%.3Lf",
+				chan->chan, rssi_score,	ACS_SCORE_RSSI * rssi_score);
+		}
 
 		bias = NULL;
 		if (iface->conf->acs_chan_bias) {

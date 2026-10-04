@@ -557,6 +557,12 @@ struct hostapd_iface {
 	unsigned int acs_num_completed_scans;
 
 	long double *acs_channel_scores;
+
+	/* Runtime ACS after the last associated station disconnects. */
+	struct os_reltime acs_last_run;
+	unsigned int acs_last_run_valid:1;
+	unsigned int acs_runtime:1;
+	unsigned int acs_idle_timer_registered:1;
 #endif /* CONFIG_ACS */
 
 	void (*scan_cb)(struct hostapd_iface *iface);

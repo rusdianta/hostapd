@@ -2301,6 +2301,11 @@ void hostapd_interface_deinit(struct hostapd_iface *iface)
 	if (iface == NULL)
 		return;
 
+#ifdef CONFIG_ACS
+	acs_idle_timer_cancel(iface);
+	iface->acs_runtime = 0;
+#endif /* CONFIG_ACS */
+
 	hostapd_set_state(iface, HAPD_IFACE_DISABLED);
 
 	eloop_cancel_timeout(channel_list_update_timeout, iface, NULL);
@@ -2668,6 +2673,11 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
 
 	if (hapd_iface == NULL)
 		return -1;
+
+#ifdef CONFIG_ACS
+	acs_idle_timer_cancel(hapd_iface);
+	hapd_iface->acs_runtime = 0;
+#endif /* CONFIG_ACS */
 
 	if (hapd_iface->bss[0]->drv_priv == NULL) {
 		wpa_printf(MSG_INFO, "Interface %s already disabled",

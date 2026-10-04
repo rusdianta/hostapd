@@ -552,12 +552,6 @@ static int is_24ghz_mode(enum hostapd_hw_mode mode)
 }
 
 
-static int is_common_24ghz_chan(int chan)
-{
-	return chan == 1 || chan == 6 || chan == 11;
-}
-
-
 #ifndef ACS_ADJ_WEIGHT
 #define ACS_ADJ_WEIGHT 0.85
 #endif /* ACS_ADJ_WEIGHT */
@@ -565,15 +559,6 @@ static int is_common_24ghz_chan(int chan)
 #ifndef ACS_NEXT_ADJ_WEIGHT
 #define ACS_NEXT_ADJ_WEIGHT 0.55
 #endif /* ACS_NEXT_ADJ_WEIGHT */
-
-#ifndef ACS_24GHZ_PREFER_1_6_11
-/*
- * Select commonly used channels 1, 6, 11 by default even if a neighboring
- * channel has a smaller interference factor as long as it is not better by more
- * than this multiplier.
- */
-#define ACS_24GHZ_PREFER_1_6_11 0.8
-#endif /* ACS_24GHZ_PREFER_1_6_11 */
 
 
 static int acs_bss_get_range(struct wpa_scan_res *bss, int *start, int *end)
@@ -731,6 +716,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		*rand_chan = NULL;
 	struct wpa_scan_results *scan_res = NULL;
 	long double factor, ideal_factor = 0;
+	long double bss_penalty;
 	int i, j;
 	int n_chans = 1;
 	u32 bw;
@@ -780,8 +766,9 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		double total_weight;
-		struct acs_bias *bias, tmp_bias;
+		struct acs_bias *bias;
 		long double bss_rssi = -100.0L;
+		long double bss_penalty = 0.0L;
 		unsigned int bss_count = 0;
 
 		chan = &iface->current_mode->channels[i];
@@ -839,8 +826,21 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		if (scan_res) {
 			bss_rssi = acs_bss_equivalent_rssi(iface, scan_res, chan, n_chans, &bss_count);
 
-			wpa_printf(MSG_DEBUG, "ACS: Channel %d BSS RSSI=%.2Lf dBm BSS=%u",
-				   chan->chan, bss_rssi, bss_count);
+			/* Convert BSS RSSI to a linear penalty in the range 0..1.
+			 *
+			 * -100 dBm = 0.0
+			 *    0 dBm = 1.0 */
+			if (bss_rssi < -100.0L)
+				bss_rssi = -100.0L;
+			else if (bss_rssi > 0.0L)
+				bss_rssi = 0.0L;
+
+			bss_penalty = (bss_rssi + 100.0L) / 100.0L;
+
+			wpa_printf(MSG_DEBUG, "ACS: Channel %d BSS RSSI=%.2Lf dBm BSS=%u penalty=%.4Lf",
+				   chan->chan, bss_rssi, bss_count, bss_penalty);
+		} else {
+			bss_penalty = 0.0L;
 		}
 
 		/* ACS SCORE CALCULATION */
@@ -913,6 +913,13 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 		factor /= total_weight;
 
+		/* Add BSS interference potential to the final channel score.
+		 *
+		 * The BSS penalty is independent from the survey interference factor:
+		 * survey data represents measured channel activity, while BSS RSSI
+		 * represents potential interference from neighboring transmitters.	*/
+		factor += bss_penalty;
+
 		bias = NULL;
 		if (iface->conf->acs_chan_bias) {
 			for (k = 0; k < iface->conf->num_acs_chan_bias; k++) {
@@ -921,11 +928,6 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 					break;
 				bias = NULL;
 			}
-		} else if (is_24ghz_mode(iface->current_mode->mode) &&
-			   is_common_24ghz_chan(chan->chan)) {
-			tmp_bias.channel = chan->chan;
-			tmp_bias.bias = ACS_24GHZ_PREFER_1_6_11;
-			bias = &tmp_bias;
 		}
 
 		if (bias) {

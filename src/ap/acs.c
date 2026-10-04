@@ -248,7 +248,7 @@
 
 
 static int acs_request_scan(struct hostapd_iface *iface);
-static int acs_survey_is_sufficient(struct freq_survey *survey);
+static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_survey *survey);
 
 
 static void acs_clean_chan_surveys(struct hostapd_channel_data *chan)
@@ -341,7 +341,7 @@ acs_survey_chan_interference_factor(struct hostapd_iface *iface,
 	{
 		i++;
 
-		if (!acs_survey_is_sufficient(survey)) {
+		if (!acs_survey_is_sufficient(iface, survey)) {
 			wpa_printf(MSG_DEBUG, "ACS: %d: insufficient data", i);
 			continue;
 		}
@@ -402,11 +402,15 @@ static int acs_usable_vht160_chan(const struct hostapd_channel_data *chan)
 }
 
 
-static int acs_survey_is_sufficient(struct freq_survey *survey)
+static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_survey *survey)
 {
 	if (!(survey->filled & SURVEY_HAS_NF)) {
 		survey->nf = ACS_DEFAULT_NOISE_FLOOR;
-		wpa_printf(MSG_INFO, "ACS: Survey is missing noise floor, default to %d dBm", ACS_DEFAULT_NOISE_FLOOR);
+
+		if (!iface->acs_nf_default_logged) {
+			wpa_printf(MSG_INFO, "ACS: Survey is missing noise floor, default to %d dBm", ACS_DEFAULT_NOISE_FLOOR);
+			iface->acs_nf_default_logged = 1;
+		}
 	}
 
 	if (!(survey->filled & SURVEY_HAS_CHAN_TIME)) {
@@ -424,14 +428,14 @@ static int acs_survey_is_sufficient(struct freq_survey *survey)
 }
 
 
-static int acs_survey_list_is_sufficient(struct hostapd_channel_data *chan)
+static int acs_survey_list_is_sufficient(struct hostapd_iface *iface, struct hostapd_channel_data *chan)
 {
 	struct freq_survey *survey;
 	int ret = -1;
 
 	dl_list_for_each(survey, &chan->survey_list, struct freq_survey, list)
 	{
-		if (acs_survey_is_sufficient(survey)) {
+		if (acs_survey_is_sufficient(iface, survey)) {
 			ret = 1;
 			break;
 		}
@@ -460,7 +464,7 @@ static int acs_surveys_are_sufficient(struct hostapd_iface *iface)
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		chan = &iface->current_mode->channels[i];
 		if (!(chan->flag & HOSTAPD_CHAN_DISABLED) &&
-		    acs_survey_list_is_sufficient(chan))
+		    acs_survey_list_is_sufficient(iface, chan))
 			valid++;
 	}
 
@@ -469,11 +473,11 @@ static int acs_surveys_are_sufficient(struct hostapd_iface *iface)
 }
 
 
-static int acs_usable_chan(struct hostapd_channel_data *chan)
+static int acs_usable_chan(struct hostapd_iface *iface, struct hostapd_channel_data *chan)
 {
 	return !dl_list_empty(&chan->survey_list) &&
 		!(chan->flag & HOSTAPD_CHAN_DISABLED) &&
-		acs_survey_list_is_sufficient(chan);
+		acs_survey_list_is_sufficient(iface, chan);
 }
 
 
@@ -496,7 +500,7 @@ static void acs_survey_all_chans_intereference_factor(
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		chan = &iface->current_mode->channels[i];
 
-		if (!acs_usable_chan(chan))
+		if (!acs_usable_chan(iface, chan))
 			continue;
 
 		if (!is_in_chanlist(iface, chan))
@@ -666,7 +670,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		}
 
 		factor = 0;
-		if (acs_usable_chan(chan))
+		if (acs_usable_chan(iface, chan))
 			factor = chan->interference_factor;
 		total_weight = 1;
 
@@ -682,7 +686,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 				break;
 			}
 
-			if (acs_usable_chan(adj_chan)) {
+			if (acs_usable_chan(iface, adj_chan)) {
 				factor += adj_chan->interference_factor;
 				total_weight += 1;
 			}
@@ -700,7 +704,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			for (j = 0; j < n_chans; j++) {
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) - 5);
-				if (adj_chan && acs_usable_chan(adj_chan)) {
+				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
 						adj_chan->interference_factor;
 					total_weight += ACS_ADJ_WEIGHT;
@@ -708,7 +712,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) - 10);
-				if (adj_chan && acs_usable_chan(adj_chan)) {
+				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
 						adj_chan->interference_factor;
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
@@ -716,7 +720,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) + 5);
-				if (adj_chan && acs_usable_chan(adj_chan)) {
+				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
 						adj_chan->interference_factor;
 					total_weight += ACS_ADJ_WEIGHT;
@@ -724,7 +728,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) + 10);
-				if (adj_chan && acs_usable_chan(adj_chan)) {
+				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
 						adj_chan->interference_factor;
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
@@ -760,7 +764,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 				   chan->chan, factor);
 		}
 
-		if (acs_usable_chan(chan) &&
+		if (acs_usable_chan(iface, chan) &&
 		    (!ideal_chan || factor < ideal_factor)) {
 			ideal_factor = factor;
 			ideal_chan = chan;
@@ -961,6 +965,8 @@ static int acs_request_scan(struct hostapd_iface *iface)
 enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 {
 	wpa_printf(MSG_INFO, "ACS: Automatic channel selection started, this may take a bit");
+
+	iface->acs_nf_fallback_logged = 0;
 
 	if (iface->drv_flags & WPA_DRIVER_FLAGS_ACS_OFFLOAD) {
 		wpa_printf(MSG_INFO, "ACS: Offloading to driver");

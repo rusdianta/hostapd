@@ -901,12 +901,14 @@ static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_sur
 	if (!(survey->filled & SURVEY_HAS_CHAN_TIME)) {
 		survey->channel_time = 0;
 		wpa_printf(MSG_INFO, "ACS: Survey is missing channel time");
+		return 0;
 	}
 
 	if (!(survey->filled & SURVEY_HAS_CHAN_TIME_BUSY) &&
 	    !(survey->filled & SURVEY_HAS_CHAN_TIME_RX)) {
 		wpa_printf(MSG_INFO,
 			   "ACS: Survey is missing RX and busy time (at least one is required)");
+		return 0;
 	}
 
 	return 1;

@@ -255,6 +255,7 @@ static int is_24ghz_mode(enum hostapd_hw_mode mode);
 static long double acs_bss_overlap_rssi_score(int rssi);
 static long double acs_frequency_overlap_ratio(int cand_start, int cand_end, int bss_start, int bss_end);
 static void acs_bss_frequency_range(struct wpa_scan_res *bss, int *start_freq, int *end_freq);
+static long double acs_bss_frequency_weight(struct wpa_scan_res *bss, int cand_freq);
 
 
 static void acs_clean_chan_surveys(struct hostapd_channel_data *chan)
@@ -333,6 +334,7 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 	long double overlap_risk;
 	long double rssi_score;
 	long double overlap_ratio;
+	long double frequency_weight;
 	int bss_start;
 	int bss_end;
 	int chan_start;
@@ -358,6 +360,11 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 
 		power = pow(10.0L, ((long double) bss->level + 90.0L) / 10.0L);
 
+		/* Convert RSSI from dBm to linear power.
+		 *
+		 * The -90 dBm reference is only a numerical reference point.
+		 * The important property is that multiple BSS contributions
+		 * are added in the linear domain. */
 		if (is_24ghz_mode(iface->current_mode->mode) && iface->acs_bss_overlap_risk) {
 			int c;
 
@@ -374,9 +381,11 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 					continue;
 
 				/* ACS overlap risk is calculated against a 20 MHz
-				* candidate channel. HT40 candidates are already
-				* evaluated through the existing primary/secondary
-				* channel scoring. */
+				 * candidate channel. HT40 candidates are already
+				 * evaluated through the existing primary/secondary
+				 * channel scoring.
+				 * Strongest-BSS overlap risk is still based on
+				 * the actual occupied BSS frequency range. */
 				chan_start = chan->freq - 10;
 				chan_end = chan->freq + 10;
 
@@ -394,6 +403,13 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 			}
 		}
 
+		/* Build frequency-aware aggregate BSS power.
+		 *
+		 * Unlike the old exact-frequency-only calculation, every
+		 * overlapping 2.4 GHz candidate receives a weighted
+		 * contribution from this BSS.
+		 *
+		 * For 5 GHz, retain the existing exact-frequency behavior. */
 		for (j = 0; j < iface->current_mode->num_channels; j++) {
 			chan = &iface->current_mode->channels[j];
 
@@ -403,22 +419,29 @@ static void acs_collect_bss_power(struct hostapd_iface *iface)
 			if (!is_in_chanlist(iface, chan))
 				continue;
 
-			if (bss->freq != chan->freq)
+			frequency_weight = 0;
+
+			if (is_24ghz_mode(iface->current_mode->mode)) {
+				frequency_weight = acs_bss_frequency_weight(bss, chan->freq);
+			} else if (bss->freq == chan->freq) {
+				frequency_weight = 1;
+			}
+
+			if (frequency_weight <= 0)
 				continue;
 
-			iface->acs_bss_power[j] += power;
+			iface->acs_bss_power[j] += power * frequency_weight;
 
-			if (bss->level > iface->acs_bss_rssi[j])
+			/* Keep direct RSSI tied to the primary/center channel
+			 * only. Overlap RSSI is represented separately by
+			 * acs_bss_overlap_risk[]. */
+			if (bss->freq == chan->freq && bss->level > iface->acs_bss_rssi[j])
 				iface->acs_bss_rssi[j] = bss->level;
 
-			/*
-			 * Avoid excessive values if a driver reports
-			 * unexpected scan results.
-			 */
+			/* Avoid excessive values if a driver reports
+			 * unexpected scan results. */
 			if (iface->acs_bss_power[j] > 1e12L)
 				iface->acs_bss_power[j] = 1e12L;
-
-			break;
 		}
 	}
 
@@ -505,6 +528,81 @@ acs_frequency_overlap_ratio(int cand_start, int cand_end, int bss_start, int bss
 
 	return (long double) overlap /
 		(long double) (cand_end - cand_start);
+}
+
+
+static long double
+acs_bss_frequency_weight(struct wpa_scan_res *bss, int cand_freq)
+{
+	int bss_start;
+	int bss_end;
+	int cand_start;
+	int cand_end;
+	int primary_start;
+	int primary_end;
+	int secondary_start;
+	int secondary_end;
+	long double primary_weight;
+	long double secondary_weight;
+
+	cand_start = cand_freq - 10;
+	cand_end = cand_freq + 10;
+
+	acs_bss_frequency_range(bss, &bss_start, &bss_end);
+
+	/* Normal 20 MHz BSS.
+	 *
+	 * The geometric overlap itself gives:
+	 *
+	 *   center       = 1.00
+	 *   +/- 5 MHz    = 0.75
+	 *   +/- 10 MHz   = 0.50
+	 *   +/- 15 MHz   = 0.25
+	 *   >= +/- 20    = 0 */
+	if (bss_end - bss_start <= 20)
+		return acs_frequency_overlap_ratio(
+			cand_start, cand_end,
+			bss_start, bss_end);
+
+	/* HT40.
+	 *
+	 * Treat the BSS as two 20 MHz components:
+	 *
+	 *   primary   = weight 1.00
+	 *   secondary = weight 0.50
+	 *
+	 * This avoids the problem of treating the whole 40 MHz
+	 * rectangular range as equally strong. The primary channel
+	 * therefore remains the strongest part of the BSS. */
+	primary_start = bss->freq - 10;
+	primary_end = bss->freq + 10;
+
+	primary_weight = acs_frequency_overlap_ratio(
+		cand_start, cand_end,
+		primary_start, primary_end);
+
+	if (bss_start == primary_start && bss_end == bss->freq + 30) {
+		/* HT40+ */
+		secondary_start = bss->freq + 10;
+		secondary_end = bss->freq + 30;
+	} else if (bss_start == bss->freq - 30 && bss_end == primary_end) {
+		/* HT40- */
+		secondary_start = bss->freq - 30;
+		secondary_end = bss->freq - 10;
+	} else {
+		/* Defensive fallback. If the frequency range does not
+		 * match the expected HT40 geometry, use the occupied
+		 * range directly. */
+		return acs_frequency_overlap_ratio(
+			cand_start, cand_end,
+			bss_start, bss_end);
+	}
+
+	secondary_weight = acs_frequency_overlap_ratio(
+		cand_start, cand_end,
+		secondary_start, secondary_end);
+
+	return primary_weight + 0.50L * secondary_weight;
 }
 
 
@@ -658,6 +756,21 @@ acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan
 		   chan->chan, score, survey_score, bss_score, bss_rssi_score, interaction);
 
 	return score;
+}
+
+
+static long double
+acs_survey_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
+			 long double survey_min, long double survey_max)
+{
+	long double survey_score;
+
+	if (survey_max > survey_min)
+		survey_score = (chan->interference_factor - survey_min) / (survey_max - survey_min);
+	else
+		survey_score = 0;
+
+	return ACS_SCORE_SURVEY * survey_score;
 }
 
 
@@ -1084,16 +1197,19 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		}
 
 		/* 2.4 GHz has overlapping 20 MHz channels. Include adjacent
-		 * channel interference factor. */
+		 * survey interference factor.
+		 *
+		 * BSS overlap is already represented by the frequency-aware
+		 * acs_bss_power[] calculation, so do not add the BSS score
+		 * again through adjacent channels. */
 		if (is_24ghz_mode(iface->current_mode->mode)) {
 			for (j = 0; j < n_chans; j++) {
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) - 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan,
-								  survey_min, survey_max,
-								  bss_min, bss_max);
+						acs_survey_channel_score(iface, adj_chan,
+									survey_min, survey_max);
 					total_weight += ACS_ADJ_WEIGHT;
 				}
 
@@ -1101,9 +1217,8 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) - 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan,
-								  survey_min, survey_max,
-								  bss_min, bss_max);
+						acs_survey_channel_score(iface, adj_chan,
+									survey_min, survey_max);
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 
@@ -1111,9 +1226,8 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) + 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan,
-								  survey_min, survey_max,
-								  bss_min, bss_max);
+						acs_survey_channel_score(iface, adj_chan,
+									survey_min, survey_max);
 					total_weight += ACS_ADJ_WEIGHT;
 				}
 
@@ -1121,9 +1235,8 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) + 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan,
-								  survey_min, survey_max,
-								  bss_min, bss_max);
+						acs_survey_channel_score(iface, adj_chan,
+									survey_min, survey_max);
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 			}
@@ -1132,10 +1245,10 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		factor /= total_weight;
 
 		/* Apply the strongest BSS RSSI penalty directly to the
-		* candidate channel after adjacent-channel averaging.
-		*
-		* This prevents a strong AP on the candidate channel from
-		* being diluted by clean adjacent channels. */
+		 * candidate channel after adjacent-channel averaging.
+		 *
+		 * This prevents a strong AP on the candidate channel from
+		 * being diluted by clean adjacent channels. */
 		if (is_24ghz_mode(iface->current_mode->mode)) {
 			long double rssi_score;
 			long double overlap_risk;

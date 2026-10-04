@@ -14,6 +14,7 @@
 #include "utils/list.h"
 #include "utils/eloop.h"
 #include "common/ieee802_11_defs.h"
+#include "common/ieee802_11_common.h"
 #include "common/hw_features_common.h"
 #include "common/wpa_ctrl.h"
 #include "drivers/driver.h"
@@ -574,6 +575,149 @@ static int is_common_24ghz_chan(int chan)
 #define ACS_24GHZ_PREFER_1_6_11 0.8
 #endif /* ACS_24GHZ_PREFER_1_6_11 */
 
+
+static int acs_bss_get_range(struct wpa_scan_res *bss, int *start, int *end)
+{
+	struct ieee802_11_elems elems;
+	struct ieee80211_ht_operation *oper;
+	int pri_freq, sec_freq;
+
+	if (!bss || !start || !end)
+		return -1;
+
+	pri_freq = bss->freq;
+	sec_freq = pri_freq;
+
+	if (bss->ie_len &&
+	    ieee802_11_parse_elems((u8 *) (bss + 1), bss->ie_len, &elems, 0) != ParseFailed &&
+	    elems.ht_operation &&
+	    elems.ht_operation_len >= sizeof(*oper)) {
+		oper = (struct ieee80211_ht_operation *) elems.ht_operation;
+
+		switch (oper->ht_param & HT_INFO_HT_PARAM_SECONDARY_CHNL_OFF_MASK) {
+		case HT_INFO_HT_PARAM_SECONDARY_CHNL_ABOVE:
+			sec_freq = pri_freq + 20;
+			break;
+		case HT_INFO_HT_PARAM_SECONDARY_CHNL_BELOW:
+			sec_freq = pri_freq - 20;
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* bss->freq is the primary 20 MHz channel center.
+	 * For HT40, the secondary channel is 20 MHz away. */
+	if (sec_freq > pri_freq) {
+		*start = pri_freq - 10;
+		*end = sec_freq + 10;
+	} else if (sec_freq < pri_freq) {
+		*start = sec_freq - 10;
+		*end = pri_freq + 10;
+	} else {
+		*start = pri_freq - 10;
+		*end = pri_freq + 10;
+	}
+
+	return 0;
+}
+
+
+static long double acs_bss_overlap(int bss_start, int bss_end, int cand_start, int cand_end)
+{
+	int start, end;
+
+	start = bss_start > cand_start ? bss_start : cand_start;
+	end = bss_end < cand_end ? bss_end : cand_end;
+
+	if (end <= start)
+		return 0;
+
+	return (long double) (end - start) / (long double) (cand_end - cand_start);
+}
+
+
+static long double
+acs_bss_equivalent_rssi(struct hostapd_iface *iface,
+			struct wpa_scan_results *scan_res,
+			struct hostapd_channel_data *chan,
+			int n_chans, unsigned int *bss_count)
+{
+	long double total_power = 0;
+	int cand_start, cand_end;
+	size_t i;
+
+	if (bss_count)
+		*bss_count = 0;
+
+	/* Candidate channel spectrum.
+	 *
+	 * ACS uses 20 MHz channel spacing. n_chans is the number
+	 * of 20 MHz channels used by the selected operating bandwidth. */
+	cand_start = chan->freq - 10;
+	cand_end = chan->freq + (n_chans * 20) - 10;
+
+	if (!scan_res)
+		return -100.0L;
+
+	for (i = 0; i < scan_res->num; i++) {
+		struct wpa_scan_res *bss = scan_res->res[i];
+		int bss_start, bss_end;
+		long double overlap;
+		int rssi;
+
+		if (!bss)
+			continue;
+
+		/* Ignore our own BSSID. */
+		if (os_memcmp(bss->bssid, iface->bss[0]->own_addr, ETH_ALEN) == 0)
+			continue;
+
+		/* RSSI must explicitly be reported in dBm.
+		 * bss->level is only treated as dBm when the driver
+		 * explicitly reports WPA_SCAN_LEVEL_DBM. */
+		if (!(bss->flags & WPA_SCAN_LEVEL_DBM))
+			continue;
+
+		rssi = bss->level;
+
+		/* Keep RSSI in the requested range.
+		 *
+		 * Values below -100 dBm are treated as -100 dBm.
+		 * Values above 0 dBm are treated as 0 dBm. */
+		if (rssi < -100)
+			rssi = -100;
+		else if (rssi > 0)
+			rssi = 0;
+
+		if (acs_bss_get_range(bss, &bss_start, &bss_end) < 0)
+			continue;
+
+		overlap = acs_bss_overlap(bss_start, bss_end, cand_start, cand_end);
+
+		if (overlap <= 0)
+			continue;
+
+		/* Convert dBm to linear power, apply spectral overlap,
+		 * then accumulate all BSS contributions. */
+		total_power += pow(10.0L, (long double) rssi / 10.0L) *	overlap;
+
+		if (bss_count)
+			(*bss_count)++;
+
+		wpa_printf(MSG_MSGDUMP,
+			   "ACS: BSS " MACSTR
+			   " freq=%d rssi=%d overlap=%Lg",
+			   MAC2STR(bss->bssid), bss->freq, rssi, overlap);
+	}
+
+	if (total_power <= 0)
+		return -100.0L;
+
+	return 10.0L * log10(total_power);
+}
+
+
 /*
  * At this point it's assumed chan->interface_factor has been computed.
  * This function should be reusable regardless of interference computation
@@ -585,6 +729,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 {
 	struct hostapd_channel_data *chan, *adj_chan, *ideal_chan = NULL,
 		*rand_chan = NULL;
+	struct wpa_scan_results *scan_res = NULL;
 	long double factor, ideal_factor = 0;
 	int i, j;
 	int n_chans = 1;
@@ -621,9 +766,23 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	wpa_printf(MSG_DEBUG,
 		   "ACS: Survey analysis for selected bandwidth %d MHz", bw);
 
+	/* Get scan results once for the complete ACS channel analysis.
+	 *
+	 * The BSS/RSSI measurement is diagnostic only in this commit.
+	 * It does not affect the existing ACS score. */
+	scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
+
+	if (!scan_res) {
+		wpa_printf(MSG_DEBUG, "ACS: No scan results available for BSS/RSSI analysis");
+	} else {
+		wpa_printf(MSG_DEBUG, "ACS: BSS/RSSI analysis using %u scan results", (unsigned int) scan_res->num);
+	}
+
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		double total_weight;
 		struct acs_bias *bias, tmp_bias;
+		long double bss_rssi = -100.0L;
+		unsigned int bss_count = 0;
 
 		chan = &iface->current_mode->channels[i];
 
@@ -676,6 +835,15 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			}
 		}
 
+		/* BSS/RSSI measurement */
+		if (scan_res) {
+			bss_rssi = acs_bss_equivalent_rssi(iface, scan_res, chan, n_chans, &bss_count);
+
+			wpa_printf(MSG_DEBUG, "ACS: Channel %d BSS RSSI=%.2Lf dBm BSS=%u",
+				   chan->chan, bss_rssi, bss_count);
+		}
+
+		/* ACS SCORE CALCULATION */
 		factor = 0;
 		if (acs_usable_chan(iface, chan))
 			factor = chan->interference_factor;
@@ -799,6 +967,9 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 				chan->chan, chan->interference_factor, iface->acs_channel_scores[i],
 				chan == ideal_chan ? " selected" : "");
 	}
+
+	if (scan_res)
+		wpa_scan_results_free(scan_res);
 
 	if (ideal_chan) {
 		wpa_printf(MSG_DEBUG, "ACS: Ideal channel is %d (%d MHz) with total interference factor of %Lg",

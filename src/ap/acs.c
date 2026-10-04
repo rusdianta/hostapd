@@ -282,6 +282,9 @@ void acs_cleanup(struct hostapd_iface *iface)
 		chan->min_nf = 0;
 	}
 
+	os_free(iface->acs_channel_scores);
+	iface->acs_channel_scores = NULL;
+
 	iface->chans_surveyed = 0;
 	iface->acs_num_completed_scans = 0;
 }
@@ -764,6 +767,10 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 				   chan->chan, factor);
 		}
 
+		/* Store the final factor for logging. */
+		if (iface->acs_channel_scores)
+			iface->acs_channel_scores[i] = factor;
+
 		if (acs_usable_chan(iface, chan) &&
 		    (!ideal_chan || factor < ideal_factor)) {
 			ideal_factor = factor;
@@ -773,6 +780,20 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		/* This channel would at least be usable */
 		if (!rand_chan)
 			rand_chan = chan;
+	}
+
+	/* Log the final values after the selection pass so that the channel
+	 * selected by ACS can be marked explicitly. */
+	for (i = 0; i < iface->current_mode->num_channels; i++) {
+		chan = &iface->current_mode->channels[i];
+
+		if (!iface->acs_channel_scores || iface->acs_channel_scores[i] < 0)
+			continue;
+		
+		wpa_printf(MSG_INFO,
+				"ACS: Channel %d interference=%Lg score=%Lg%s",
+				chan->chan, chan->interference_factor, iface->acs_channel_scores[i],
+				chan == ideal_chan ? " selected" : "");
 	}
 
 	if (ideal_chan) {
@@ -964,6 +985,8 @@ static int acs_request_scan(struct hostapd_iface *iface)
 
 enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 {
+	unsigned int i;
+
 	wpa_printf(MSG_INFO, "ACS: Automatic channel selection started, this may take a bit");
 
 	iface->acs_nf_default_logged = 0;
@@ -979,6 +1002,16 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 		return HOSTAPD_CHAN_INVALID;
 
 	acs_cleanup(iface);
+
+	iface->acs_channel_scores = os_malloc(iface->current_mode->num_channels * sizeof(*iface->acs_channel_scores));
+	if (!iface->acs_channel_scores) {
+		acs_cleanup(iface);
+		return HOSTAPD_CHAN_INVALID;
+	}
+
+	for (i = 0; i < iface->current_mode->num_channels; i++) {
+		iface->acs_channel_scores[i] = -1;
+	}
 
 	if (acs_request_scan(iface) < 0)
 		return HOSTAPD_CHAN_INVALID;

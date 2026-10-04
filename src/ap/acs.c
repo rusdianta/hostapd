@@ -242,6 +242,11 @@
  */
 
 
+#ifndef ACS_DEFAULT_NOISE_FLOOR
+#define ACS_DEFAULT_NOISE_FLOOR -100
+#endif /* ACS_DEFAULT_NOISE_FLOOR */
+
+
 static int acs_request_scan(struct hostapd_iface *iface);
 static int acs_survey_is_sufficient(struct freq_survey *survey);
 
@@ -400,8 +405,8 @@ static int acs_usable_vht160_chan(const struct hostapd_channel_data *chan)
 static int acs_survey_is_sufficient(struct freq_survey *survey)
 {
 	if (!(survey->filled & SURVEY_HAS_NF)) {
-		survey->nf = -95;
-		wpa_printf(MSG_INFO, "ACS: Survey is missing noise floor");
+		survey->nf = ACS_DEFAULT_NOISE_FLOOR;
+		wpa_printf(MSG_INFO, "ACS: Survey is missing noise floor, default to %d dBm", ACS_DEFAULT_NOISE_FLOOR);
 	}
 
 	if (!(survey->filled & SURVEY_HAS_CHAN_TIME)) {

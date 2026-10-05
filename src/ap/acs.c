@@ -574,6 +574,60 @@ static int is_common_24ghz_chan(int chan)
 #define ACS_24GHZ_PREFER_1_6_11 0.8
 #endif /* ACS_24GHZ_PREFER_1_6_11 */
 
+
+static long double
+acs_bss_equivalent_rssi(struct hostapd_iface *iface,
+			struct wpa_scan_results *scan_res,
+			struct hostapd_channel_data *chan)
+{
+	int max_rssi = -100;
+	size_t i;
+
+	if (!scan_res)
+		return -100.0L;
+
+	for (i = 0; i < scan_res->num; i++) {
+		struct wpa_scan_res *bss = scan_res->res[i];
+		int rssi;
+
+		if (!bss)
+			continue;
+
+		/* Ignore our own BSSID. */
+		if (os_memcmp(bss->bssid, iface->bss[0]->own_addr, ETH_ALEN) == 0)
+			continue;
+
+		/* RSSI must explicitly be reported in dBm. */
+		if (!(bss->flags & WPA_SCAN_LEVEL_DBM))
+			continue;
+
+		/* Only consider BSSes on the candidate channel.
+		 * Adjacent-channel interference is handled by
+		 * the survey-based ACS calculation. */
+		if (bss->freq != chan->freq)
+			continue;
+
+		rssi = bss->level;
+
+		/* Keep RSSI in the requested range. */
+		if (rssi < -100)
+			rssi = -100;
+		else if (rssi > 0)
+			rssi = 0;
+
+		if (rssi > max_rssi)
+			max_rssi = rssi;
+
+		wpa_printf(MSG_MSGDUMP,
+			   "ACS: BSS " MACSTR
+			   " freq=%d rssi=%d",
+			   MAC2STR(bss->bssid), bss->freq, rssi);
+	}
+
+	return (long double) max_rssi;
+}
+
+
 /*
  * At this point it's assumed chan->interface_factor has been computed.
  * This function should be reusable regardless of interference computation
@@ -585,6 +639,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 {
 	struct hostapd_channel_data *chan, *adj_chan, *ideal_chan = NULL,
 		*rand_chan = NULL;
+	struct wpa_scan_results *scan_res = NULL;
 	long double factor, ideal_factor = 0;
 	int i, j;
 	int n_chans = 1;
@@ -621,9 +676,22 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	wpa_printf(MSG_DEBUG,
 		   "ACS: Survey analysis for selected bandwidth %d MHz", bw);
 
+	/* Get scan results once for the complete ACS channel analysis.
+	 *
+	 * The BSS/RSSI measurement contributes to the final ACS score
+	 * as a potential interference factor. */
+	scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
+
+	if (!scan_res) {
+		wpa_printf(MSG_DEBUG, "ACS: No scan results available for BSS/RSSI analysis");
+	} else {
+		wpa_printf(MSG_DEBUG, "ACS: BSS/RSSI analysis using %u scan results", (unsigned int) scan_res->num);
+	}
+
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		double total_weight;
 		struct acs_bias *bias, tmp_bias;
+		long double bss_rssi = -100.0L;
 
 		chan = &iface->current_mode->channels[i];
 
@@ -676,6 +744,15 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			}
 		}
 
+		/* BSS/RSSI measurement */
+		if (scan_res) {
+			bss_rssi = acs_bss_equivalent_rssi(iface, scan_res, chan);
+
+			wpa_printf(MSG_DEBUG, "ACS: Channel %d BSS RSSI=%.2Lf dBm",
+				   chan->chan, bss_rssi);
+		}
+
+		/* ACS SCORE CALCULATION */
 		factor = 0;
 		if (acs_usable_chan(iface, chan))
 			factor = chan->interference_factor;
@@ -799,6 +876,9 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 				chan->chan, chan->interference_factor, iface->acs_channel_scores[i],
 				chan == ideal_chan ? " selected" : "");
 	}
+
+	if (scan_res)
+		wpa_scan_results_free(scan_res);
 
 	if (ideal_chan) {
 		wpa_printf(MSG_DEBUG, "ACS: Ideal channel is %d (%d MHz) with total interference factor of %Lg",

@@ -649,6 +649,8 @@ acs_bss_equivalent_rssi(struct hostapd_iface *iface,
 		int bss_start, bss_end;
 		long double overlap;
 		int rssi;
+		size_t j;
+		int duplicate = 0;
 
 		if (!bss)
 			continue;
@@ -680,6 +682,46 @@ acs_bss_equivalent_rssi(struct hostapd_iface *iface,
 		overlap = acs_bss_overlap(bss_start, bss_end, cand_start, cand_end);
 
 		if (overlap <= 0)
+			continue;
+
+		/* A scan result may contain the same BSSID more than once.
+		 *
+		 * Only count the BSSID once. Check whether an earlier
+		 * occurrence of the same BSSID was also a valid result
+		 * overlapping the candidate channel.
+		 *
+		 * This intentionally does not treat an invalid or
+		 * non-overlapping entry as having claimed the BSSID. */
+		for (j = 0; j < i; j++) {
+			struct wpa_scan_res *prev = scan_res->res[j];
+			int prev_start, prev_end;
+			long double prev_overlap;
+
+			if (!prev)
+				continue;
+
+			if (os_memcmp(bss->bssid, prev->bssid, ETH_ALEN) != 0)
+				continue;
+
+			if (os_memcmp(prev->bssid, iface->bss[0]->own_addr, ETH_ALEN) == 0)
+				continue;
+
+			if (!(prev->flags & WPA_SCAN_LEVEL_DBM))
+				continue;
+
+			if (acs_bss_get_range(prev, &prev_start, &prev_end) < 0)
+				continue;
+
+			prev_overlap = acs_bss_overlap(prev_start, prev_end, cand_start, cand_end);
+
+			if (prev_overlap <= 0)
+				continue;
+
+			duplicate = 1;
+			break;
+		}
+
+		if (duplicate)
 			continue;
 
 		/* Convert dBm to linear power, apply spectral overlap,

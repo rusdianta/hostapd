@@ -289,6 +289,9 @@ void acs_cleanup(struct hostapd_iface *iface)
 	os_free(iface->acs_channel_scores);
 	iface->acs_channel_scores = NULL;
 
+	os_free(iface->acs_bss_rssi);
+	iface->acs_bss_rssi = NULL;
+
 	iface->chans_surveyed = 0;
 	iface->acs_num_completed_scans = 0;
 }
@@ -299,6 +302,113 @@ static void acs_fail(struct hostapd_iface *iface)
 	wpa_printf(MSG_ERROR, "ACS: Failed to start");
 	acs_cleanup(iface);
 	hostapd_disable_iface(iface);
+}
+
+
+static void
+acs_collect_bss_rssi(struct hostapd_iface *iface)
+{
+	struct wpa_scan_results *scan_res;
+	struct wpa_scan_res *bss;
+	struct hostapd_channel_data *chan;
+	unsigned int i, j, k;
+	int rssi;
+
+	if (!iface->acs_bss_rssi)
+		return;
+
+	scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
+	if (!scan_res) {
+		wpa_printf(MSG_DEBUG, "ACS: Could not get scan results for BSS RSSI");
+		return;
+	}
+
+	for (i = 0; i < scan_res->num; i++) {
+		bss = scan_res->res[i];
+
+		if (!bss)
+			continue;
+
+		if (!(bss->flags & WPA_SCAN_LEVEL_DBM))
+			continue;
+
+		/* Ignore our own BSSIDs. */
+		for (k = 0; k < iface->num_bss; k++) {
+			if (os_memcmp(bss->bssid, iface->bss[k]->own_addr, ETH_ALEN) == 0)
+				break;
+		}
+
+		if (k < iface->num_bss)
+			continue;
+
+		/* Keep RSSI in the fixed -100..0 dBm range. */
+		rssi = bss->level;
+
+		if (rssi < -100)
+			rssi = -100;
+		else if (rssi > 0)
+			rssi = 0;
+
+		for (j = 0; j < iface->current_mode->num_channels; j++) {
+			chan = &iface->current_mode->channels[j];
+
+			if (chan->flag & HOSTAPD_CHAN_DISABLED)
+				continue;
+
+			if (!is_in_chanlist(iface, chan))
+				continue;
+
+			if (bss->freq != chan->freq)
+				continue;
+
+			/* Keep only the strongest BSS on this channel. */
+			if (rssi > iface->acs_bss_rssi[j])
+				iface->acs_bss_rssi[j] = rssi;
+
+			break;
+		}
+	}
+
+	wpa_scan_results_free(scan_res);
+}
+
+
+static int
+acs_bss_rssi_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data *chan)
+{
+	unsigned int idx;
+
+	if (!iface->acs_bss_rssi)
+		return -100;
+
+	idx = chan - iface->current_mode->channels;
+
+	if (idx >= iface->current_mode->num_channels)
+		return -100;
+
+	return iface->acs_bss_rssi[idx];
+}
+
+
+static long double
+acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
+		  long double survey_min, long double survey_max)
+{
+	long double survey_score;
+	long double bss_score;
+	int bss_rssi;
+
+	if (survey_max > survey_min)
+		survey_score = (chan->interference_factor - survey_min) / (survey_max - survey_min);
+	else
+		survey_score = 0.0L;
+
+	bss_rssi = acs_bss_rssi_for_chan(iface, chan);
+
+	/* Convert RSSI from -100..0 dBm to 0..1. */
+	bss_score =	((long double) bss_rssi + 100.0L) / 100.0L;
+
+	return survey_score + bss_score;
 }
 
 
@@ -319,9 +429,15 @@ acs_survey_interference_factor(struct freq_survey *survey, s8 min_nf)
 		total -= survey->channel_time_tx;
 	}
 
+	if (total <= 0)
+		return 0;
+
+	if (busy < 0)
+		busy = 0;
+
 	/* TODO: figure out the best multiplier for noise floor base */
 	factor = pow(10, survey->nf / 5.0L) +
-		(total ? (busy / total) : 0) *
+		(busy / total) *
 		pow(2, pow(10, (long double) survey->nf / 10.0L) -
 		    pow(10, (long double) min_nf / 10.0L));
 
@@ -551,12 +667,6 @@ static int is_24ghz_mode(enum hostapd_hw_mode mode)
 }
 
 
-static int is_common_24ghz_chan(int chan)
-{
-	return chan == 1 || chan == 6 || chan == 11;
-}
-
-
 #ifndef ACS_ADJ_WEIGHT
 #define ACS_ADJ_WEIGHT 0.85
 #endif /* ACS_ADJ_WEIGHT */
@@ -565,14 +675,6 @@ static int is_common_24ghz_chan(int chan)
 #define ACS_NEXT_ADJ_WEIGHT 0.55
 #endif /* ACS_NEXT_ADJ_WEIGHT */
 
-#ifndef ACS_24GHZ_PREFER_1_6_11
-/*
- * Select commonly used channels 1, 6, 11 by default even if a neighboring
- * channel has a smaller interference factor as long as it is not better by more
- * than this multiplier.
- */
-#define ACS_24GHZ_PREFER_1_6_11 0.8
-#endif /* ACS_24GHZ_PREFER_1_6_11 */
 
 /*
  * At this point it's assumed chan->interface_factor has been computed.
@@ -586,6 +688,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	struct hostapd_channel_data *chan, *adj_chan, *ideal_chan = NULL,
 		*rand_chan = NULL;
 	long double factor, ideal_factor = 0;
+	long double survey_min = 0, survey_max = 0;
 	int i, j;
 	int n_chans = 1;
 	u32 bw;
@@ -621,6 +724,27 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	wpa_printf(MSG_DEBUG,
 		   "ACS: Survey analysis for selected bandwidth %d MHz", bw);
 
+	/* Find the minimum and maximum survey interference factors.
+	 * BSS RSSI uses a fixed -100..0 dBm scale and therefore does not
+	 * need relative min/max normalization. */
+	for (i = 0; i < iface->current_mode->num_channels; i++) {
+		chan = &iface->current_mode->channels[i];
+
+		if (!acs_usable_chan(iface, chan))
+			continue;
+
+		if (!is_in_chanlist(iface, chan))
+			continue;
+
+		if (!survey_min || chan->interference_factor < survey_min)
+			survey_min = chan->interference_factor;
+
+		if (chan->interference_factor > survey_max)
+			survey_max = chan->interference_factor;
+	}
+
+	/* BSS scan results are collected once and the strongest RSSI for
+	 * each channel is used by acs_channel_score(). */
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		double total_weight;
 		struct acs_bias *bias, tmp_bias;
@@ -678,7 +802,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 		factor = 0;
 		if (acs_usable_chan(iface, chan))
-			factor = chan->interference_factor;
+			factor = acs_channel_score(iface, chan, survey_min, survey_max);
 		total_weight = 1;
 
 		for (j = 1; j < n_chans; j++) {
@@ -694,7 +818,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			}
 
 			if (acs_usable_chan(iface, adj_chan)) {
-				factor += adj_chan->interference_factor;
+				factor += acs_channel_score(iface, adj_chan, survey_min, survey_max);
 				total_weight += 1;
 			}
 		}
@@ -713,7 +837,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) - 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
-						adj_chan->interference_factor;
+						acs_channel_score(iface, adj_chan, survey_min, survey_max);
 					total_weight += ACS_ADJ_WEIGHT;
 				}
 
@@ -721,7 +845,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) - 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
-						adj_chan->interference_factor;
+						acs_channel_score(iface, adj_chan, survey_min, survey_max);
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 
@@ -729,7 +853,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) + 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_ADJ_WEIGHT *
-						adj_chan->interference_factor;
+						acs_channel_score(iface, adj_chan, survey_min, survey_max);
 					total_weight += ACS_ADJ_WEIGHT;
 				}
 
@@ -737,7 +861,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 							 (j * 20) + 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
 					factor += ACS_NEXT_ADJ_WEIGHT *
-						adj_chan->interference_factor;
+						acs_channel_score(iface, adj_chan, survey_min, survey_max);
 					total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 			}
@@ -935,6 +1059,8 @@ static void acs_scan_complete(struct hostapd_iface *iface)
 	wpa_printf(MSG_DEBUG, "ACS: Using survey based algorithm (acs_num_scans=%d)",
 		   iface->conf->acs_num_scans);
 
+	acs_collect_bss_rssi(iface);
+
 	err = hostapd_drv_get_survey(iface->bss[0], 0);
 	if (err) {
 		wpa_printf(MSG_ERROR, "ACS: Failed to get survey data");
@@ -1029,8 +1155,15 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 		return HOSTAPD_CHAN_INVALID;
 	}
 
+	iface->acs_bss_rssi = os_malloc(iface->current_mode->num_channels * sizeof(*iface->acs_bss_rssi));
+	if (!iface->acs_bss_rssi) {
+		acs_cleanup(iface);
+		return HOSTAPD_CHAN_INVALID;
+	}
+
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
 		iface->acs_channel_scores[i] = -1;
+		iface->acs_bss_rssi[i] = -100;
 	}
 
 	if (acs_request_scan(iface) < 0)

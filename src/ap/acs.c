@@ -759,6 +759,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	long double factor, ideal_factor = 0;
 	long double *chan_bss_rssi = NULL;
 	long double *chan_bss_rssi_factor = NULL;
+	unsigned int *chan_bss_count = NULL;
 	int i, j;
 	int n_chans = 1;
 	u32 bw;
@@ -799,11 +800,13 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	 * not leave uninitialized values in the log. */
 	chan_bss_rssi = os_malloc(iface->current_mode->num_channels * sizeof(*chan_bss_rssi));
 	chan_bss_rssi_factor = os_malloc(iface->current_mode->num_channels * sizeof(*chan_bss_rssi_factor));
+	chan_bss_count = os_malloc(iface->current_mode->num_channels * sizeof(*chan_bss_count));
 
-	if (!chan_bss_rssi || !chan_bss_rssi_factor) {
+	if (!chan_bss_rssi || !chan_bss_rssi_factor || !chan_bss_count) {
 		wpa_printf(MSG_ERROR, "ACS: Failed to allocate BSS/RSSI channel data");
 		os_free(chan_bss_rssi);
 		os_free(chan_bss_rssi_factor);
+		os_free(chan_bss_count);
 		return NULL;
 	}
 
@@ -828,6 +831,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 		chan_bss_rssi[i] = -100.0L;
 		chan_bss_rssi_factor[i] = 0.0L;
+		chan_bss_count[i] = 0;
 
 		chan = &iface->current_mode->channels[i];
 
@@ -901,6 +905,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 		chan_bss_rssi[i] = bss_rssi;
 		chan_bss_rssi_factor[i] = bss_rssi_factor;
+		chan_bss_count[i] = bss_count;
 
 		/* ACS SCORE CALCULATION */
 		factor = 0;
@@ -1024,8 +1029,8 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			continue;
 		
 		wpa_printf(MSG_INFO,
-				"ACS: Channel %d rssi=%.2LfdBm factor=%.4Lf interference=%Lg score=%Lg%s",
-				chan->chan, chan_bss_rssi[i], chan_bss_rssi_factor[i], chan->interference_factor, iface->acs_channel_scores[i],
+				"ACS: Channel %d rssi=%.2LfdBm bss=%u factor=%.4Lf interference=%Lg score=%Lg%s",
+				chan->chan, chan_bss_rssi[i], chan_bss_count[i], chan_bss_rssi_factor[i], chan->interference_factor, iface->acs_channel_scores[i],
 				chan == ideal_chan ? " selected" : "");
 	}
 
@@ -1034,6 +1039,7 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 
 	os_free(chan_bss_rssi);
 	os_free(chan_bss_rssi_factor);
+	os_free(chan_bss_count);
 
 	if (ideal_chan) {
 		wpa_printf(MSG_DEBUG, "ACS: Ideal channel is %d (%d MHz) with total interference factor of %Lg",

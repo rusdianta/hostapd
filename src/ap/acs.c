@@ -913,10 +913,17 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		if (!iface->acs_channel_scores || iface->acs_channel_scores[i] < 0)
 			continue;
 		
-		wpa_printf(MSG_INFO,
-				"ACS: Channel %d interference=%Lg score=%Lg%s",
+		if (iface->acs_bss_rssi[i] > -100) {
+			wpa_printf(MSG_INFO,
+				"ACS: channel %d rssi=%d interference=%Lg score=%Lg%s",
+				chan->chan, iface->acs_bss_rssi[i], chan->interference_factor, iface->acs_channel_scores[i],
+				chan == ideal_chan ? " selected" : "");
+		} else {
+			wpa_printf(MSG_INFO,
+				"ACS: channel %d rssi=none interference=%Lg score=%Lg%s",
 				chan->chan, chan->interference_factor, iface->acs_channel_scores[i],
 				chan == ideal_chan ? " selected" : "");
+		}
 	}
 
 	if (ideal_chan) {

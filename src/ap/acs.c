@@ -323,24 +323,31 @@ acs_bss_rssi_for_chan(struct hostapd_iface *iface, struct hostapd_channel_data *
 
 
 static long double
-acs_channel_score(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
-		  long double survey_min, long double survey_max)
+acs_bss_score(struct hostapd_iface *iface,
+              struct hostapd_channel_data *chan)
 {
-	long double survey_score;
-	long double bss_score;
-	int bss_rssi;
+    int bss_rssi;
 
-	if (survey_max > survey_min)
-		survey_score = (chan->interference_factor - survey_min) / (survey_max - survey_min);
-	else
-		survey_score = 0.0L;
+    bss_rssi = acs_bss_rssi_for_chan(iface, chan);
 
-	bss_rssi = acs_bss_rssi_for_chan(iface, chan);
+    /* Convert RSSI from -100..0 dBm to 0..1. */
+	if (bss_rssi < -100)
+		bss_rssi = -100;
+	if (bss_rssi > 0)
+		bss_rssi = 0;
 
-	/* Convert RSSI from -100..0 dBm to 0..1. */
-	bss_score =	((long double) bss_rssi + 100.0L) / 100.0L;
+	return ((long double) bss_rssi + 100.0L) / 100.0L;
+}
 
-	return survey_score + bss_score;
+
+static long double
+acs_survey_score(struct hostapd_channel_data *chan,
+                 long double survey_min, long double survey_max)
+{
+    if (survey_max > survey_min)
+        return (chan->interference_factor - survey_min) / (survey_max - survey_min);
+
+    return 0.0L;
 }
 
 
@@ -668,12 +675,28 @@ static int is_24ghz_mode(enum hostapd_hw_mode mode)
 
 
 #ifndef ACS_ADJ_WEIGHT
-#define ACS_ADJ_WEIGHT 0.85
+#define ACS_ADJ_WEIGHT 0.618
 #endif /* ACS_ADJ_WEIGHT */
 
 #ifndef ACS_NEXT_ADJ_WEIGHT
-#define ACS_NEXT_ADJ_WEIGHT 0.55
+#define ACS_NEXT_ADJ_WEIGHT 0.382
 #endif /* ACS_NEXT_ADJ_WEIGHT */
+
+#ifndef ACS_BSS_ADJ_WEIGHT
+#define ACS_BSS_ADJ_WEIGHT 0.5
+#endif /* ACS_BSS_ADJ_WEIGHT */
+
+#ifndef ACS_BSS_NEXT_ADJ_WEIGHT
+#define ACS_BSS_NEXT_ADJ_WEIGHT 0.25
+#endif /* ACS_BSS_NEXT_ADJ_WEIGHT */
+
+#ifndef ACS_BSS_WEIGHT
+#define ACS_BSS_WEIGHT 0.8
+#endif /* ACS_BSS_WEIGHT */
+
+#ifndef ACS_SURVEY_WEIGHT
+#define ACS_SURVEY_WEIGHT 0.2
+#endif /* ACS_SURVEY_WEIGHT */
 
 
 /*
@@ -689,6 +712,9 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		*rand_chan = NULL;
 	long double factor, ideal_factor = 0;
 	long double survey_min = 0, survey_max = 0;
+	long double bss_score, survey_score;
+	long double bss_factor, survey_factor;
+	long double bss_total_weight, survey_total_weight;
 	int i, j;
 	int n_chans = 1;
 	u32 bw;
@@ -744,9 +770,27 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 	}
 
 	/* BSS scan results are collected once and the strongest RSSI for
-	 * each channel is used by acs_channel_score(). */
+	 * each channel is used by acs_channel_score().
+	 *
+	 * Calculate the score for every possible primary channel.
+	 *
+	 * BSS and survey are calculated independently:
+	 *
+	 *   BSS:
+	 *     center       = 1.000
+	 *     adjacent     = 0.500
+	 *     next adjacent = 0.250
+	 *
+	 *   Survey:
+	 *     center       = 1.000
+	 *     adjacent     = ACS_ADJ_WEIGHT (0.618)
+	 *     next adjacent = ACS_NEXT_ADJ_WEIGHT (0.382)
+	 *
+	 * The two resulting factors are then combined:
+	 *
+	 *   score = BSS * 0.80 + survey * 0.20
+	 */
 	for (i = 0; i < iface->current_mode->num_channels; i++) {
-		double total_weight;
 		struct acs_bias *bias;
 
 		chan = &iface->current_mode->channels[i];
@@ -800,11 +844,27 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			}
 		}
 
-		factor = 0;
-		if (acs_usable_chan(iface, chan))
-			factor = acs_channel_score(iface, chan, survey_min, survey_max);
-		total_weight = 1;
+		/* Survey interference is normalized independently from BSS RSSI.
+		 * BSS RSSI uses the fixed -100..0 dBm scale.
+		 *
+		 * Start with the primary channel. */
+		bss_score = 0.0L;
+		survey_score = 0.0L;
 
+		bss_total_weight = 0.0L;
+		survey_total_weight = 0.0L;
+
+		if (acs_usable_chan(iface, chan)) {
+			bss_score =	acs_bss_channel_score(iface, chan);
+			survey_score = acs_survey_channel_score(chan, survey_min, survey_max);
+
+			bss_total_weight = 1.0L;
+			survey_total_weight = 1.0L;
+		}
+
+		/* Include secondary channels for HT40/VHT/HE bandwidth.
+		 *
+		 * BSS and survey are accumulated independently. */
 		for (j = 1; j < n_chans; j++) {
 			adj_chan = acs_find_chan(iface, chan->freq + (j * 20));
 			if (!adj_chan)
@@ -818,8 +878,11 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 			}
 
 			if (acs_usable_chan(iface, adj_chan)) {
-				factor += acs_channel_score(iface, adj_chan, survey_min, survey_max);
-				total_weight += 1;
+				bss_score += acs_bss_channel_score(iface, adj_chan);
+				survey_score += acs_survey_channel_score(adj_chan, survey_min, survey_max);
+
+				bss_total_weight += 1.0L;
+				survey_total_weight += 1.0L;
 			}
 		}
 
@@ -830,44 +893,88 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
 		}
 
 		/* 2.4 GHz has overlapping 20 MHz channels. Include adjacent
-		 * channel interference factor. */
+		 * channel interference factor.
+		 *
+		 * Survey uses golden ratio ACS overlap weighting:
+		 *
+		 *     +/- 5 MHz  -> ACS_ADJ_WEIGHT      (0.618)
+		 *     +/- 10 MHz -> ACS_NEXT_ADJ_WEIGHT (0.382)
+		 *
+		 * BSS uses linear weighting:
+		 *
+		 *     +/- 5 MHz  -> 0.500
+		 *     +/- 10 MHz -> 0.250
+		 */
 		if (is_24ghz_mode(iface->current_mode->mode)) {
 			for (j = 0; j < n_chans; j++) {
+				/* Adjacent channel -5 MHz. */
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) - 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
-					factor += ACS_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan, survey_min, survey_max);
-					total_weight += ACS_ADJ_WEIGHT;
+					bss_score += ACS_BSS_ADJ_WEIGHT *
+						acs_bss_channel_score(iface, adj_chan);
+					bss_total_weight += ACS_BSS_ADJ_WEIGHT;
+
+					survey_score += ACS_ADJ_WEIGHT *
+						acs_survey_channel_score(adj_chan, survey_min, survey_max);
+					survey_total_weight += ACS_ADJ_WEIGHT;
 				}
 
+				/* Next adjacent channel -10 MHz. */
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) - 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
-					factor += ACS_NEXT_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan, survey_min, survey_max);
-					total_weight += ACS_NEXT_ADJ_WEIGHT;
+					bss_score += ACS_BSS_NEXT_ADJ_WEIGHT *
+						acs_bss_channel_score(iface, adj_chan);
+					bss_total_weight += ACS_BSS_NEXT_ADJ_WEIGHT;
+
+					survey_score += ACS_NEXT_ADJ_WEIGHT *
+						acs_survey_channel_score(adj_chan, survey_min, survey_max);
+					survey_total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 
+				/* Adjacent channel +5 MHz. */
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) + 5);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
-					factor += ACS_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan, survey_min, survey_max);
-					total_weight += ACS_ADJ_WEIGHT;
+					bss_score += ACS_BSS_ADJ_WEIGHT *
+						acs_bss_channel_score(iface, adj_chan);
+					bss_total_weight += ACS_BSS_ADJ_WEIGHT;
+
+					survey_score += ACS_ADJ_WEIGHT *
+						acs_survey_channel_score(adj_chan, survey_min, survey_max);
+					survey_total_weight += ACS_ADJ_WEIGHT;
 				}
 
+				/* Next adjacent channel +10 MHz. */
 				adj_chan = acs_find_chan(iface, chan->freq +
 							 (j * 20) + 10);
 				if (adj_chan && acs_usable_chan(iface, adj_chan)) {
-					factor += ACS_NEXT_ADJ_WEIGHT *
-						acs_channel_score(iface, adj_chan, survey_min, survey_max);
-					total_weight += ACS_NEXT_ADJ_WEIGHT;
+					bss_score += ACS_BSS_NEXT_ADJ_WEIGHT *
+						acs_bss_channel_score(iface, adj_chan);
+					bss_total_weight += ACS_BSS_NEXT_ADJ_WEIGHT;
+
+					survey_score += ACS_NEXT_ADJ_WEIGHT *
+						acs_survey_channel_score(adj_chan, survey_min, survey_max);
+					survey_total_weight += ACS_NEXT_ADJ_WEIGHT;
 				}
 			}
 		}
 
-		factor /= total_weight;
+		/* Normalize BSS and survey independently. */
+		if (bss_total_weight > 0.0L)
+			bss_factor = bss_score / bss_total_weight;
+		else
+			bss_factor = 0.0L;
+
+		if (survey_total_weight > 0.0L)
+			survey_factor = survey_score / survey_total_weight;
+		else
+			survey_factor = 0.0L;
+
+		/* 80% BSS/RSSI
+		 * 20% survey/interference */
+		factor = ACS_BSS_WEIGHT * bss_factor + ACS_SURVEY_WEIGHT * survey_factor;
 
 		bias = NULL;
 		if (iface->conf->acs_chan_bias) {

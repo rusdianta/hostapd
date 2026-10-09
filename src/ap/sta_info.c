@@ -425,6 +425,14 @@ void ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
 	unsigned long next_time = 0;
 	int reason;
 
+	// DEBUG
+	wpa_printf(MSG_INFO,
+           "STA-DBG timer: " MACSTR
+           " flags=0x%x timeout_next=%d max_inactivity=%d",
+           MAC2STR(sta->addr), sta->flags,
+           sta->timeout_next,
+           hapd->conf->ap_max_inactivity);
+
 	wpa_printf(MSG_DEBUG, "%s: %s: " MACSTR " flags=0x%x timeout_next=%d",
 		   hapd->conf->iface, __func__, MAC2STR(sta->addr), sta->flags,
 		   sta->timeout_next);
@@ -448,6 +456,15 @@ void ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
 		 */
 		int fuzz = os_random() % 20;
 		inactive_sec = hostapd_drv_get_inact_sec(hapd, sta->addr);
+
+		// DEBUG
+		wpa_printf(MSG_INFO,
+           "STA-DBG get_inact_sec: " MACSTR
+           " result=%d flags=0x%x timeout_next=%d",
+           MAC2STR(sta->addr), inactive_sec,
+           sta->flags, sta->timeout_next);
+
+
 		if (inactive_sec == -1) {
 			wpa_msg(hapd->msg_ctx, MSG_DEBUG,
 				"Check inactivity: Could not "
@@ -511,6 +528,14 @@ skip_poll:
 
 	if (sta->timeout_next == STA_NULLFUNC &&
 	    (sta->flags & WLAN_STA_ASSOC)) {
+
+			// DEBUG
+		wpa_printf(MSG_INFO,
+           "STA-DBG poll: " MACSTR
+           " flags=0x%x timeout_next=%d",
+           MAC2STR(sta->addr), sta->flags,
+           sta->timeout_next);
+
 		wpa_printf(MSG_DEBUG, "  Polling STA");
 		sta->flags |= WLAN_STA_PENDING_POLL;
 		hostapd_drv_poll_client(hapd, hapd->own_addr, sta->addr,
@@ -529,6 +554,13 @@ skip_poll:
 			"Timeout, sending %s info to STA " MACSTR,
 			deauth ? "deauthentication" : "disassociation",
 			MAC2STR(sta->addr));
+
+		// DEBUG
+		wpa_printf(MSG_INFO,
+           "STA-DBG send_disconnect: " MACSTR
+           " deauth=%d timeout_next=%d flags=0x%x",
+           MAC2STR(sta->addr), deauth,
+           sta->timeout_next, sta->flags);
 
 		if (deauth) {
 			hostapd_drv_sta_deauth(
@@ -828,6 +860,14 @@ void ap_sta_disassociate(struct hostapd_data *hapd, struct sta_info *sta,
 		sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
 		sta->timeout_next = STA_DEAUTH;
 	}
+
+	// DEBUG
+	wpa_printf(MSG_INFO,
+           "STA-DBG ap_sta_disassociate: " MACSTR
+           " reason=%u flags=0x%x timeout_next=%d",
+           MAC2STR(sta->addr), reason,
+           sta->flags, sta->timeout_next);
+
 	ap_sta_set_authorized(hapd, sta, 0);
 	wpa_printf(MSG_DEBUG, "%s: reschedule ap_handle_timer timeout "
 		   "for " MACSTR " (%d seconds - "
@@ -880,6 +920,14 @@ void ap_sta_deauthenticate(struct hostapd_data *hapd, struct sta_info *sta,
 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
 	ap_sta_set_authorized(hapd, sta, 0);
 	sta->timeout_next = STA_REMOVE;
+
+	// DEBUG
+		wpa_printf(MSG_INFO,
+           "STA-DBG ap_sta_deauthenticate: " MACSTR
+           " reason=%u flags=0x%x timeout_next=%d",
+           MAC2STR(sta->addr), reason,
+           sta->flags, sta->timeout_next);
+
 	wpa_printf(MSG_DEBUG, "%s: reschedule ap_handle_timer timeout "
 		   "for " MACSTR " (%d seconds - "
 		   "AP_MAX_INACTIVITY_AFTER_DEAUTH)",

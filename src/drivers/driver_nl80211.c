@@ -7413,6 +7413,7 @@ static int wpa_driver_nl80211_if_remove(struct i802_bss *bss,
 		if (drv->first_bss->next) {
 			drv->first_bss = drv->first_bss->next;
 			drv->ctx = drv->first_bss->ctx;
+			drv->ifindex = drv->first_bss->ifindex;
 			os_free(bss);
 		} else {
 			wpa_printf(MSG_DEBUG, "nl80211: No second BSS to reassign context to");

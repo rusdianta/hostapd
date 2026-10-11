@@ -2739,7 +2739,7 @@ static int wpa_driver_nl80211_del_beacon(struct i802_bss *bss)
 	struct nl_msg *msg;
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 
-	if (!bss->beacon_set)
+	if (!link || !link->beacon_set)
 		return 0;
 
 	bss->beacon_set = 0;

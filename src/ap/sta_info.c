@@ -431,7 +431,7 @@ void ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
 	if (sta->timeout_next == STA_REMOVE) {
 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 			       HOSTAPD_LEVEL_INFO, "deauthenticated due to "
-			       "local deauth request");
+			       "local deauth request (reason %s)", reason2str(reason));
 		ap_free_sta(hapd, sta);
 		hostapd_ubus_notify(hapd, "local-deauth", sta->addr);
 		return;
@@ -564,7 +564,7 @@ skip_poll:
 		ieee802_1x_free_station(hapd, sta);
 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 			       HOSTAPD_LEVEL_INFO, "disassociated due to "
-			       "inactivity");
+			       "inactivity (reason %s)", reason2str(reason));
 		reason = (sta->timeout_next == STA_DISASSOC) ?
 			WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY :
 			WLAN_REASON_PREV_AUTH_NOT_VALID;
@@ -580,7 +580,7 @@ skip_poll:
 	case STA_REMOVE:
 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 			       HOSTAPD_LEVEL_INFO, "deauthenticated due to "
-			       "inactivity (timer DEAUTH/REMOVE)");
+			       "inactivity (timer DEAUTH/REMOVE reason %s)", reason2str(reason));
 		if (!sta->acct_terminate_cause)
 			sta->acct_terminate_cause =
 				RADIUS_ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT;

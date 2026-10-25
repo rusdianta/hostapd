@@ -555,6 +555,8 @@ struct hostapd_iface {
 
 #ifdef CONFIG_ACS
 	unsigned int acs_num_completed_scans;
+
+	long double *acs_channel_scores;
 #endif /* CONFIG_ACS */
 
 	void (*scan_cb)(struct hostapd_iface *iface);

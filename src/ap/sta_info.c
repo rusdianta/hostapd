@@ -188,6 +188,15 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 			~BIT((sta->aid - 1) % 32);
 
 	hapd->num_sta--;
+
+#ifdef CONFIG_ACS
+	if (hapd->num_sta == 0 &&
+	    hapd->iface->state == HAPD_IFACE_ENABLED &&
+	    !hapd->iface->driver_ap_teardown &&
+	    acs_iface_num_sta(hapd->iface) == 0)
+		acs_idle_timer_schedule(hapd->iface);
+#endif /* CONFIG_ACS */
+
 	if (sta->nonerp_set) {
 		sta->nonerp_set = 0;
 		hapd->iface->num_sta_non_erp--;
@@ -721,6 +730,11 @@ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
 	sta->next = hapd->sta_list;
 	hapd->sta_list = sta;
 	hapd->num_sta++;
+
+#ifdef CONFIG_ACS
+	acs_idle_timer_cancel(hapd->iface);
+#endif /* CONFIG_ACS */
+
 	ap_sta_hash_add(hapd, sta);
 	ap_sta_remove_in_other_bss(hapd, sta);
 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;

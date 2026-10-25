@@ -1145,6 +1145,10 @@ static void acs_study(struct hostapd_iface *iface)
 			return;
 		}
 
+		/* Runtime channel switch request succeeded. */
+		os_get_reltime(&iface->acs_last_run);
+		iface->acs_last_run_valid = 1;
+
 		iface->acs_runtime = 0;
 		acs_cleanup(iface);
 		if (iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA)
@@ -1167,6 +1171,11 @@ fail:
 	 * 0 on success and 0 is HOSTAPD_CHAN_VALID :)
 	 */
 	if (hostapd_acs_completed(iface, err) == HOSTAPD_CHAN_VALID) {
+		if (!err) {
+			/* Startup ACS completed successfully. */
+			os_get_reltime(&iface->acs_last_run);
+			iface->acs_last_run_valid = 1;
+		}
 		acs_cleanup(iface);
 		return;
 	}
@@ -1300,11 +1309,6 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 	if (acs_request_scan(iface) < 0) {
 		acs_cleanup(iface);
 		return HOSTAPD_CHAN_INVALID;
-	}
-
-	if (iface->acs_runtime) {
-		os_get_reltime(&iface->acs_last_run);
-		iface->acs_last_run_valid = 1;
 	}
 
 	hostapd_set_state(iface, HAPD_IFACE_ACS);

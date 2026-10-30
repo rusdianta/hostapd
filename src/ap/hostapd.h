@@ -562,6 +562,7 @@ struct hostapd_iface {
 	struct os_reltime acs_last_run;
 	unsigned int acs_last_run_valid:1;
 	unsigned int acs_runtime:1;
+	unsigned int acs_cooldown_timer_registered:1;
 	unsigned int acs_idle_timer_registered:1;
 #endif /* CONFIG_ACS */
 

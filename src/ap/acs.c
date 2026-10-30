@@ -248,9 +248,12 @@
 #endif /* ACS_DEFAULT_NOISE_FLOOR */
 
 #define ACS_IDLE_TIMEOUT 30
+#define ACS_RUNTIME_INTERVAL 86400
 
 
 static int acs_request_scan(struct hostapd_iface *iface);
+static void acs_runtime_cooldown_schedule(struct hostapd_iface *iface);
+static void acs_runtime_cooldown_timeout(void *eloop_data, void *user_ctx);
 static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_survey *survey);
 static int acs_runtime_switch_channel(struct hostapd_iface *iface, struct hostapd_channel_data *ideal_chan);
 
@@ -1147,6 +1150,7 @@ static void acs_study(struct hostapd_iface *iface)
 		/* Runtime channel switch request succeeded. */
 		os_get_reltime(&iface->acs_last_run);
 		iface->acs_last_run_valid = 1;
+		acs_runtime_cooldown_schedule(iface);
 
 		iface->acs_runtime = 0;
 		acs_cleanup(iface);
@@ -1174,6 +1178,7 @@ fail:
 			/* Startup ACS completed successfully. */
 			os_get_reltime(&iface->acs_last_run);
 			iface->acs_last_run_valid = 1;
+			acs_runtime_cooldown_schedule(iface);
 		}
 		acs_cleanup(iface);
 		return;
@@ -1331,6 +1336,50 @@ int acs_iface_num_sta(struct hostapd_iface *iface)
 }
 
 
+static int acs_runtime_cooldown_expired(struct hostapd_iface *iface)
+{
+	struct os_reltime now;
+
+	if (!iface->acs_last_run_valid)
+		return 1;
+
+	os_get_reltime(&now);
+
+	return os_reltime_expired(&now, &iface->acs_last_run, ACS_RUNTIME_INTERVAL);
+}
+
+
+static void acs_runtime_cooldown_schedule(struct hostapd_iface *iface)
+{
+	if (iface->acs_cooldown_timer_registered) {
+		eloop_cancel_timeout(acs_runtime_cooldown_timeout, iface, NULL);
+		iface->acs_cooldown_timer_registered = 0;
+	}
+
+	if (eloop_register_timeout(ACS_RUNTIME_INTERVAL, 0, acs_runtime_cooldown_timeout, iface, NULL) < 0) {
+		wpa_printf(MSG_ERROR, "ACS: Failed to register runtime cooldown timer");
+		return;
+	}
+
+	iface->acs_cooldown_timer_registered = 1;
+}
+
+
+static void acs_runtime_cooldown_timeout(void *eloop_data, void *user_ctx)
+{
+	struct hostapd_iface *iface = eloop_data;
+
+	iface->acs_cooldown_timer_registered = 0;
+
+	if (iface->state != HAPD_IFACE_ENABLED || iface->driver_ap_teardown || !acs_runtime_cooldown_expired(iface))
+		return;
+
+	/* Cooldown has expired. Start idle timing only if no station is associated. */
+	if (acs_iface_num_sta(iface) == 0)
+		acs_idle_timer_schedule(iface);
+}
+
+
 static void acs_idle_timeout(void *eloop_data, void *user_ctx)
 {
 	struct hostapd_iface *iface = eloop_data;
@@ -1338,6 +1387,9 @@ static void acs_idle_timeout(void *eloop_data, void *user_ctx)
 	iface->acs_idle_timer_registered = 0;
 
 	if (iface->state != HAPD_IFACE_ENABLED || iface->driver_ap_teardown || acs_iface_num_sta(iface) != 0)
+		return;
+
+	if (!acs_runtime_cooldown_expired(iface))
 		return;
 
 	wpa_printf(MSG_INFO, "ACS: Starting runtime ACS after %d seconds with no associated STA", ACS_IDLE_TIMEOUT);
@@ -1369,6 +1421,10 @@ void acs_idle_timer_schedule(struct hostapd_iface *iface)
 	if (iface->state != HAPD_IFACE_ENABLED || iface->driver_ap_teardown || acs_iface_num_sta(iface) != 0)
 		return;
 
+	/* Cooldown must expire before idle timing starts. */
+	if (!acs_runtime_cooldown_expired(iface))
+		return;
+
 	acs_idle_timer_cancel(iface);
 
 	if (eloop_register_timeout(ACS_IDLE_TIMEOUT, 0, acs_idle_timeout, iface, NULL) < 0) {
@@ -1379,6 +1435,17 @@ void acs_idle_timer_schedule(struct hostapd_iface *iface)
 	iface->acs_idle_timer_registered = 1;
 
 	wpa_printf(MSG_INFO, "ACS: Last STA disconnected, scheduling runtime ACS in %d seconds", ACS_IDLE_TIMEOUT);
+}
+
+
+void acs_runtime_timers_cancel(struct hostapd_iface *iface)
+{
+	acs_idle_timer_cancel(iface);
+
+	if (iface->acs_cooldown_timer_registered) {
+		eloop_cancel_timeout(acs_runtime_cooldown_timeout, iface, NULL);
+		iface->acs_cooldown_timer_registered = 0;
+	}
 }
 
 

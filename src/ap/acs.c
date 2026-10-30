@@ -12,6 +12,7 @@
 
 #include "utils/common.h"
 #include "utils/list.h"
+#include "utils/eloop.h"
 #include "common/ieee802_11_defs.h"
 #include "common/hw_features_common.h"
 #include "common/wpa_ctrl.h"
@@ -246,10 +247,12 @@
 #define ACS_DEFAULT_NOISE_FLOOR -100
 #endif /* ACS_DEFAULT_NOISE_FLOOR */
 
+#define ACS_IDLE_TIMEOUT 30
+
 
 static int acs_request_scan(struct hostapd_iface *iface);
 static int acs_survey_is_sufficient(struct hostapd_iface *iface, struct freq_survey *survey);
-
+static int acs_runtime_switch_channel(struct hostapd_iface *iface, struct hostapd_channel_data *ideal_chan);
 
 static void acs_clean_chan_surveys(struct hostapd_channel_data *chan)
 {
@@ -344,6 +347,20 @@ acs_survey_score(struct hostapd_channel_data *chan,
         return (chan->interference_factor - survey_min) / (survey_max - survey_min);
 
     return 0.0L;
+}
+
+
+static int acs_runtime_fail(struct hostapd_iface *iface)
+{
+	if (!iface->acs_runtime)
+		return 0;
+
+	iface->acs_runtime = 0;
+	acs_cleanup(iface);
+	hostapd_set_state(iface, HAPD_IFACE_ENABLED);
+	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, ACS_EVENT_FAILED);
+
+	return 1;
 }
 
 
@@ -1117,6 +1134,27 @@ static void acs_study(struct hostapd_iface *iface)
 		goto fail;
 	}
 
+	if (iface->acs_runtime) {
+		err = acs_runtime_switch_channel(iface, ideal_chan);
+		if (err) {
+			iface->acs_runtime = 0;
+			acs_cleanup(iface);
+			hostapd_set_state(iface, HAPD_IFACE_ENABLED);
+			wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, ACS_EVENT_FAILED);
+			return;
+		}
+
+		/* Runtime channel switch request succeeded. */
+		os_get_reltime(&iface->acs_last_run);
+		iface->acs_last_run_valid = 1;
+
+		iface->acs_runtime = 0;
+		acs_cleanup(iface);
+		if (iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA)
+			hostapd_set_state(iface, HAPD_IFACE_ENABLED);
+		return;
+	}
+
 	iface->conf->channel = ideal_chan->chan;
 
 	if (iface->conf->ieee80211ac || iface->conf->ieee80211ax)
@@ -1124,11 +1162,19 @@ static void acs_study(struct hostapd_iface *iface)
 
 	err = 0;
 fail:
+	if (acs_runtime_fail(iface))
+		return;
+
 	/*
 	 * hostapd_setup_interface_complete() will return -1 on failure,
 	 * 0 on success and 0 is HOSTAPD_CHAN_VALID :)
 	 */
 	if (hostapd_acs_completed(iface, err) == HOSTAPD_CHAN_VALID) {
+		if (!err) {
+			/* Startup ACS completed successfully. */
+			os_get_reltime(&iface->acs_last_run);
+			iface->acs_last_run_valid = 1;
+		}
 		acs_cleanup(iface);
 		return;
 	}
@@ -1170,6 +1216,9 @@ static void acs_scan_complete(struct hostapd_iface *iface)
 	acs_study(iface);
 	return;
 fail:
+	if (acs_runtime_fail(iface))
+		return;
+
 	hostapd_acs_completed(iface, 1);
 	acs_fail(iface);
 }
@@ -1208,6 +1257,8 @@ static int acs_request_scan(struct hostapd_iface *iface)
 
 	if (hostapd_driver_scan(iface->bss[0], &params) < 0) {
 		wpa_printf(MSG_ERROR, "ACS: Failed to request initial scan");
+
+		iface->scan_cb = NULL;
 		acs_cleanup(iface);
 		os_free(params.freqs);
 		return -1;
@@ -1224,6 +1275,7 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 
 	wpa_printf(MSG_INFO, "ACS: Automatic channel selection started, this may take a bit");
 
+	iface->acs_num_completed_scans = 0;
 	iface->acs_nf_default_logged = 0;
 
 	if (iface->drv_flags & WPA_DRIVER_FLAGS_ACS_OFFLOAD) {
@@ -1264,4 +1316,139 @@ enum hostapd_chan_status acs_init(struct hostapd_iface *iface)
 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, ACS_EVENT_STARTED);
 
 	return HOSTAPD_CHAN_ACS;
+}
+
+
+int acs_iface_num_sta(struct hostapd_iface *iface)
+{
+	size_t i;
+	int num_sta = 0;
+
+	for (i = 0; i < iface->num_bss; i++)
+		num_sta += iface->bss[i]->num_sta;
+
+	return num_sta;
+}
+
+
+static void acs_idle_timeout(void *eloop_data, void *user_ctx)
+{
+	struct hostapd_iface *iface = eloop_data;
+
+	iface->acs_idle_timer_registered = 0;
+
+	if (iface->state != HAPD_IFACE_ENABLED || iface->driver_ap_teardown || acs_iface_num_sta(iface) != 0)
+		return;
+
+	wpa_printf(MSG_INFO, "ACS: Starting runtime ACS after %d seconds with no associated STA", ACS_IDLE_TIMEOUT);
+
+	iface->acs_runtime = 1;
+
+	if (acs_init(iface) != HOSTAPD_CHAN_ACS)
+	{
+		iface->acs_runtime = 0;
+		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, ACS_EVENT_FAILED);
+	}
+}
+
+
+void acs_idle_timer_cancel(struct hostapd_iface *iface)
+{
+	if (!iface->acs_idle_timer_registered)
+		return;
+
+	eloop_cancel_timeout(acs_idle_timeout, iface, NULL);
+	iface->acs_idle_timer_registered = 0;
+
+	wpa_printf(MSG_INFO, "ACS: Runtime ACS idle timer cancelled");
+}
+
+
+void acs_idle_timer_schedule(struct hostapd_iface *iface)
+{
+	if (iface->state != HAPD_IFACE_ENABLED || iface->driver_ap_teardown || acs_iface_num_sta(iface) != 0)
+		return;
+
+	acs_idle_timer_cancel(iface);
+
+	if (eloop_register_timeout(ACS_IDLE_TIMEOUT, 0, acs_idle_timeout, iface, NULL) < 0) {
+		wpa_printf(MSG_ERROR, "ACS: Failed to register runtime ACS idle timer");
+    	return;
+	}
+
+	iface->acs_idle_timer_registered = 1;
+
+	wpa_printf(MSG_INFO, "ACS: Last STA disconnected, scheduling runtime ACS in %d seconds", ACS_IDLE_TIMEOUT);
+}
+
+
+static int acs_build_freq_params(struct hostapd_iface *iface, struct hostapd_channel_data *chan,
+	struct hostapd_freq_params *params)
+{
+	int center_segment0 = 0;
+
+	switch (hostapd_get_oper_chwidth(iface->conf)) {
+	case CHANWIDTH_USE_HT:
+		if (iface->conf->secondary_channel)
+			center_segment0 = chan->chan + 2 * iface->conf->secondary_channel;
+		break;
+	case CHANWIDTH_80MHZ:
+		center_segment0 = chan->chan + 6;
+		break;
+	case CHANWIDTH_160MHZ:
+		center_segment0 = chan->chan + 14;
+		break;
+	default:
+		wpa_printf(MSG_ERROR, "ACS: Unsupported channel width for runtime ACS");
+		return -1;
+	}
+
+	return hostapd_set_freq_params(params, iface->conf->hw_mode, chan->freq, chan->chan,
+		iface->conf->ieee80211n, iface->conf->ieee80211ac, iface->conf->ieee80211ax,
+		iface->conf->secondary_channel, hostapd_get_oper_chwidth(iface->conf), center_segment0, 0,
+		iface->conf->vht_capab,	iface->current_mode ? &iface->current_mode->he_capab[IEEE80211_MODE_AP] : NULL);
+}
+
+
+static int acs_runtime_switch_channel(struct hostapd_iface *iface, struct hostapd_channel_data *ideal_chan)
+{
+	struct csa_settings settings;
+	unsigned int i;
+	int ret;
+
+	os_memset(&settings, 0, sizeof(settings));
+
+	ret = acs_build_freq_params(iface, ideal_chan, &settings.freq_params);
+	if (ret)
+		return ret;
+
+	settings.cs_count = 5;
+	settings.block_tx = 0;
+
+	wpa_printf(MSG_INFO, "ACS: Runtime ACS selected channel %d (%d MHz)", ideal_chan->chan, ideal_chan->freq);
+
+	if (iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA) {
+		for (i = 0; i < iface->num_bss; i++) {
+			hostapd_chan_switch_vht_config(iface->bss[i], settings.freq_params.vht_enabled);
+
+			ret = hostapd_switch_channel(iface->bss[i], &settings);
+			if (ret) {
+				wpa_printf(MSG_ERROR, "ACS: Runtime CSA failed for BSS %s", iface->bss[i]->conf->iface);
+				return ret;
+			}
+		}
+
+		return 0;
+	}
+
+	wpa_printf(MSG_INFO, "ACS: Driver does not support CSA, restarting interface");
+
+	/* hostapd_switch_channel_fallback() performs disable -> enable
+	 * synchronously. Clear the runtime flag before doing that so that
+	 * interface reinitialization follows the normal startup path. */
+	iface->acs_runtime = 0;
+
+	hostapd_switch_channel_fallback(iface, &settings.freq_params);
+
+	return 0;
 }

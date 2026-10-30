@@ -17,6 +17,7 @@ void acs_cleanup(struct hostapd_iface *iface);
 int acs_iface_num_sta(struct hostapd_iface *iface);
 void acs_idle_timer_cancel(struct hostapd_iface *iface);
 void acs_idle_timer_schedule(struct hostapd_iface *iface);
+void acs_runtime_timers_cancel(struct hostapd_iface *iface);
 
 #else /* CONFIG_ACS */
 

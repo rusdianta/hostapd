@@ -2302,7 +2302,7 @@ void hostapd_interface_deinit(struct hostapd_iface *iface)
 		return;
 
 #ifdef CONFIG_ACS
-	acs_idle_timer_cancel(iface);
+	acs_runtime_timers_cancel(iface);
 	iface->acs_runtime = 0;
 #endif /* CONFIG_ACS */
 
@@ -2675,7 +2675,7 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
 		return -1;
 
 #ifdef CONFIG_ACS
-	acs_idle_timer_cancel(hapd_iface);
+	acs_runtime_timers_cancel(hapd_iface);
 	hapd_iface->acs_runtime = 0;
 #endif /* CONFIG_ACS */
 
